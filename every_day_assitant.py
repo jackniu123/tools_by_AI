@@ -8,7 +8,7 @@ def run_proxy_finder():
     """在独立线程中运行代理查找程序"""
     try:
         import proxy_finder.proxy_finder
-        # proxy_finder.proxy_finder.main()
+        proxy_finder.proxy_finder.main()
     except Exception as e:
         print(f"代理查找程序异常退出: {e}")
 
@@ -16,7 +16,7 @@ def run_new_stock_monitor():
     """在独立线程中运行新股监控程序"""
     try:
         import new_stock_monitor.new_stock_monitor
-        # new_stock_monitor.new_stock_monitor.main()
+        new_stock_monitor.new_stock_monitor.main()
     except Exception as e:
         print(f"新股监控程序异常退出: {e}")
 

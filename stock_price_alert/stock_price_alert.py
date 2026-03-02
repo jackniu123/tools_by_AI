@@ -19,12 +19,30 @@ import pandas as pd
 import alert_checker  # 导入检查模块，用于启动后台服务
 
 # ==================== 日志配置 ====================
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+import os
+import logging
+from logging.handlers import RotatingFileHandler
+
+# ==================== 日志配置 ====================
+LOG_DIR = r"C:\Users\Administrator\stock_price_alert"
+LOG_FILE = os.path.join(LOG_DIR, "ui.log")
+
+os.makedirs(LOG_DIR, exist_ok=True)
+
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+file_handler = RotatingFileHandler(LOG_FILE, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+# 原有其他导入保持不变...
 
 # ==================== 全局变量 ====================
 # 修改：配置文件固定路径

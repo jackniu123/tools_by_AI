@@ -17,12 +17,35 @@ import tkinter as tk
 from tkinter import messagebox
 
 # ==================== 日志配置 ====================
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+import os
+import logging
+from logging.handlers import RotatingFileHandler
+
+# ==================== 日志配置 ====================
+LOG_DIR = r"C:\Users\Administrator\stock_price_alert"
+LOG_FILE = os.path.join(LOG_DIR, "alert_checker.log")
+
+# 确保日志目录存在
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# 创建 logger
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# 定义日志格式
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+# 文件 Handler（按大小轮转，最多保留5个文件，每个最大10MB）
+file_handler = RotatingFileHandler(LOG_FILE, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+# 控制台 Handler（保留，便于调试；pythonw 下无效但不影响）
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+# 原有其他导入保持不变...
 
 # ==================== 全局变量 ====================
 # 修改：配置文件固定路径
