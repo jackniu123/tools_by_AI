@@ -2,24 +2,20 @@
 """
 股价提醒检查模块，独立于UI运行。
 提供 start_checker() 函数启动后台定时检查（每5分钟）。
-配置文件路径：C:\\Users\\Administrator\\stock_price_alert\\alerts_config.json
+配置文件路径：C:/Users/Administrator/stock_price_alert/alerts_config.json
 """
 import time
 import threading
 import json
 import os
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 import schedule
 import akshare as ak
 import pandas as pd
 import tkinter as tk
 from tkinter import messagebox
-
-# ==================== 日志配置 ====================
-import os
-import logging
-from logging.handlers import RotatingFileHandler
 
 # ==================== 日志配置 ====================
 LOG_DIR = r"C:\Users\Administrator\stock_price_alert"
@@ -32,27 +28,21 @@ os.makedirs(LOG_DIR, exist_ok=True)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-# 定义日志格式
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
-# 文件 Handler（按大小轮转，最多保留5个文件，每个最大10MB）
-file_handler = RotatingFileHandler(LOG_FILE, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
+file_handler = RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding='utf-8')
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
-# 控制台 Handler（保留，便于调试；pythonw 下无效但不影响）
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
-# 原有其他导入保持不变...
-
 # ==================== 全局变量 ====================
-# 修改：配置文件固定路径
 CONFIG_DIR = r"C:\Users\Administrator\stock_price_alert"
 CONFIG_FILE = os.path.join(CONFIG_DIR, "alerts_config.json")
-PRICE_ALERTS = {}  # 将在每次检查前重新加载
-VOLATILITY_ALERTS = {}
+PRICE_ALERTS = {}  # 格式: {symbol: {"name": str, "high": float, "low": float}}
+VOLATILITY_ALERTS = {}  # 格式: {symbol: {"name": str, "threshold": float}}
 last_prices = {}  # 存储上一次价格，用于波动计算
 _market_cache = {}  # 市场数据缓存
 
@@ -72,13 +62,15 @@ def load_config():
                 symbol = item.get('symbol')
                 if not symbol:
                     continue
+                symbol = str(symbol)
+                name = item.get('name', '')
                 thresholds = {}
                 if item.get('high') is not None:
                     thresholds['high'] = float(item['high'])
                 if item.get('low') is not None:
                     thresholds['low'] = float(item['low'])
                 if thresholds:
-                    new_price[symbol] = thresholds
+                    new_price[symbol] = {'name': name, **thresholds}
             PRICE_ALERTS = new_price
 
             # 波动提醒
@@ -86,10 +78,15 @@ def load_config():
             new_vol = {}
             for item in vol_list:
                 symbol = item.get('symbol')
+                if not symbol:
+                    continue
+                symbol = str(symbol)
+                name = item.get('name', '')
                 threshold = item.get('threshold')
-                if symbol and threshold is not None:
-                    new_vol[symbol] = float(threshold)
+                if threshold is not None:
+                    new_vol[symbol] = {'name': name, 'threshold': float(threshold)}
             VOLATILITY_ALERTS = new_vol
+
             logger.info(f"重新加载配置：到价提醒 {len(PRICE_ALERTS)} 条，波动提醒 {len(VOLATILITY_ALERTS)} 条")
         except Exception as e:
             logger.error(f"加载配置文件失败: {e}")
@@ -100,26 +97,29 @@ def load_config():
 
 
 def save_config():
-    """将当前配置保存到JSON文件（此函数在检查器中通常不需要，但保留供UI使用）"""
+    """保存配置到JSON文件（供UI调用，检查器中也可保留）"""
     price_list = []
-    for symbol, thresholds in PRICE_ALERTS.items():
-        item = {'symbol': symbol}
-        if 'high' in thresholds:
-            item['high'] = thresholds['high']
-        if 'low' in thresholds:
-            item['low'] = thresholds['low']
+    for symbol, info in PRICE_ALERTS.items():
+        item = {'symbol': str(symbol), 'name': info.get('name', '')}
+        if 'high' in info:
+            item['high'] = info['high']
+        if 'low' in info:
+            item['low'] = info['low']
         price_list.append(item)
 
     vol_list = []
-    for symbol, threshold in VOLATILITY_ALERTS.items():
-        vol_list.append({'symbol': symbol, 'threshold': threshold})
+    for symbol, info in VOLATILITY_ALERTS.items():
+        vol_list.append({
+            'symbol': str(symbol),
+            'name': info.get('name', ''),
+            'threshold': info['threshold']
+        })
 
     data = {
         'price_alerts': price_list,
         'volatility_alerts': vol_list
     }
     try:
-        # 确保目录存在
         os.makedirs(CONFIG_DIR, exist_ok=True)
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -392,17 +392,22 @@ def check_price_alerts():
 
 
 def check_volatility_alerts():
-    """检查波动提醒"""
+    """
+    检查波动提醒
+    监控范围：所有到价提醒的股票 + 所有波动提醒中独立配置的股票
+    波动阈值优先使用波动提醒中的设置，若不存在则使用默认 9%
+    """
     global last_prices
-    alerts = VOLATILITY_ALERTS.copy()
-    if not alerts:
-        logger.debug("波动提醒列表为空，跳过")
+    # 合并股票列表（去重）
+    all_symbols = set(PRICE_ALERTS.keys()) | set(VOLATILITY_ALERTS.keys())
+    if not all_symbols:
+        logger.debug("波动提醒监控列表为空，跳过")
         return
-    logger.info(f"开始检查波动提醒，监控 {len(alerts)} 只股票")
+    logger.info(f"开始检查波动提醒，监控 {len(all_symbols)} 只股票")
 
     # 按市场分组
     market_groups = {'A': [], 'HK': [], 'US': []}
-    for symbol in alerts.keys():
+    for symbol in all_symbols:
         if symbol.endswith('.HK'):
             market_groups['HK'].append(symbol)
         elif symbol.endswith('.US'):
@@ -415,6 +420,7 @@ def check_volatility_alerts():
         if not symbols:
             continue
 
+        # 交易时间判断
         if market == 'A' and not is_a_trading_time(now):
             logger.info(f"A股非交易时间，跳过该市场 {len(symbols)} 只股票的波动检查")
             continue
@@ -438,10 +444,17 @@ def check_volatility_alerts():
             previous = last_prices.get(symbol)
             if previous is not None:
                 change_pct = (current - previous) / previous * 100
-                logger.debug(f"{symbol} 当前 {current}，上次 {previous}，变化 {change_pct:.2f}%")
-                if abs(change_pct) >= alerts[symbol]:
+
+                # 确定阈值：优先使用波动提醒独立配置，否则默认 9%
+                if symbol in VOLATILITY_ALERTS:
+                    threshold = VOLATILITY_ALERTS[symbol]['threshold']
+                else:
+                    threshold = 9.0  # 默认阈值
+
+                logger.debug(f"{symbol} 当前 {current}，上次 {previous}，变化 {change_pct:.2f}% (阈值 {threshold}%)")
+                if abs(change_pct) >= threshold:
                     direction = "上涨" if change_pct > 0 else "下跌"
-                    logger.info(f"{symbol} 触发波动提醒: 变化 {abs(change_pct):.2f}% >= {alerts[symbol]}%")
+                    logger.info(f"{symbol} 触发波动提醒: 变化 {abs(change_pct):.2f}% >= {threshold}%")
                     show_alert(
                         f"波动提醒：{symbol} 当前价 {current}，较上次 {previous} {direction} {abs(change_pct):.2f}%")
             last_prices[symbol] = current
