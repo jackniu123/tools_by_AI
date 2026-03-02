@@ -1,0 +1,95 @@
+{
+  "price_alerts": [
+    {
+      "symbol": "000538",
+      "name": "云南白药",
+      "high": 75.0,
+      "low": 20.0
+    },
+    {
+      "symbol": "300059",
+      "name": "东方财富",
+      "high": 27.0,
+      "low": 20.0
+    },
+    {
+      "symbol": "002739",
+      "name": "万达电影",
+      "high": 25.0,
+      "low": 10.0
+    },
+    {
+      "symbol": "600999",
+      "name": "招商证券",
+      "high": 20.0,
+      "low": 10.0
+    },
+    {
+      "symbol": "001979",
+      "name": "招商蛇口",
+      "high": 13.0,
+      "low": 7.0
+    },
+    {
+      "symbol": "601211",
+      "name": "国泰海通",
+      "high": 50.0,
+      "low": 10.0
+    },
+    {
+      "symbol": "000069",
+      "name": "华侨城",
+      "high": 5.2,
+      "low": 1.0
+    },
+    {
+      "symbol": "600153",
+      "name": "建发股份",
+      "high": 10.93,
+      "low": 5.0
+    },
+    {
+      "symbol": "AAL.US",
+      "name": "美国航空",
+      "high": 19.0,
+      "low": 8.0
+    },
+    {
+      "symbol": "ORGN.US",
+      "name": "Origin Materials",
+      "high": 2.0,
+      "low": 0.1
+    },
+    {
+      "symbol": "02007.HK",
+      "name": "碧桂园",
+      "high": 0.5,
+      "low": 0.2
+    },
+    {
+      "symbol": "02777.HK",
+      "name": "富力地产",
+      "high": 2.03,
+      "low": 0.5
+    },
+    {
+      "symbol": "02202.HK",
+      "name": "万科企业",
+      "high": 8.0,
+      "low": 3.5
+    },
+    {
+      "symbol": "03301.HK",
+      "name": "融信中国",
+      "high": 1.0,
+      "low": 0.2
+    }
+  ],
+  "volatility_alerts": [
+    {
+      "symbol": "000001",
+      "name": "",
+      "threshold": 9.0
+    }
+  ]
+}

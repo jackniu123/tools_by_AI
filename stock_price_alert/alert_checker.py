@@ -1,0 +1,498 @@
+# -*- coding: utf-8 -*-
+"""
+股价提醒检查模块，独立于UI运行。
+提供 start_checker() 函数启动后台定时检查（每5分钟）。
+配置文件路径：C:\\Users\\Administrator\\stock_price_alert\\alerts_config.json
+"""
+import time
+import threading
+import json
+import os
+import logging
+from datetime import datetime, timedelta
+import schedule
+import akshare as ak
+import pandas as pd
+import tkinter as tk
+from tkinter import messagebox
+
+# ==================== 日志配置 ====================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# ==================== 全局变量 ====================
+# 修改：配置文件固定路径
+CONFIG_DIR = r"C:\Users\Administrator\stock_price_alert"
+CONFIG_FILE = os.path.join(CONFIG_DIR, "alerts_config.json")
+PRICE_ALERTS = {}  # 将在每次检查前重新加载
+VOLATILITY_ALERTS = {}
+last_prices = {}  # 存储上一次价格，用于波动计算
+_market_cache = {}  # 市场数据缓存
+
+
+# ==================== 配置加载 ====================
+def load_config():
+    """从配置文件加载提醒设置到全局变量"""
+    global PRICE_ALERTS, VOLATILITY_ALERTS
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            # 到价提醒
+            price_list = data.get('price_alerts', [])
+            new_price = {}
+            for item in price_list:
+                symbol = item.get('symbol')
+                if not symbol:
+                    continue
+                thresholds = {}
+                if item.get('high') is not None:
+                    thresholds['high'] = float(item['high'])
+                if item.get('low') is not None:
+                    thresholds['low'] = float(item['low'])
+                if thresholds:
+                    new_price[symbol] = thresholds
+            PRICE_ALERTS = new_price
+
+            # 波动提醒
+            vol_list = data.get('volatility_alerts', [])
+            new_vol = {}
+            for item in vol_list:
+                symbol = item.get('symbol')
+                threshold = item.get('threshold')
+                if symbol and threshold is not None:
+                    new_vol[symbol] = float(threshold)
+            VOLATILITY_ALERTS = new_vol
+            logger.info(f"重新加载配置：到价提醒 {len(PRICE_ALERTS)} 条，波动提醒 {len(VOLATILITY_ALERTS)} 条")
+        except Exception as e:
+            logger.error(f"加载配置文件失败: {e}")
+    else:
+        PRICE_ALERTS = {}
+        VOLATILITY_ALERTS = {}
+        logger.info("配置文件不存在，使用空配置")
+
+
+def save_config():
+    """将当前配置保存到JSON文件（此函数在检查器中通常不需要，但保留供UI使用）"""
+    price_list = []
+    for symbol, thresholds in PRICE_ALERTS.items():
+        item = {'symbol': symbol}
+        if 'high' in thresholds:
+            item['high'] = thresholds['high']
+        if 'low' in thresholds:
+            item['low'] = thresholds['low']
+        price_list.append(item)
+
+    vol_list = []
+    for symbol, threshold in VOLATILITY_ALERTS.items():
+        vol_list.append({'symbol': symbol, 'threshold': threshold})
+
+    data = {
+        'price_alerts': price_list,
+        'volatility_alerts': vol_list
+    }
+    try:
+        # 确保目录存在
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        logger.info(f"配置已保存到 {CONFIG_FILE}")
+    except Exception as e:
+        logger.error(f"保存配置文件失败: {e}")
+
+
+# ==================== 数据获取与缓存 ====================
+def get_market_data(market):
+    """获取指定市场的全市场实时行情数据，使用缓存（5分钟有效期）"""
+    global _market_cache
+    now = datetime.now()
+    if market in _market_cache:
+        cache_entry = _market_cache[market]
+        if now - cache_entry['timestamp'] < timedelta(minutes=5):
+            logger.debug(f"缓存命中 {market} 市场数据")
+            return cache_entry['data']
+        else:
+            logger.debug(f"{market} 市场数据缓存过期")
+
+    logger.info(f"正在请求 {market} 市场数据...")
+    try:
+        if market == 'A':
+            df = ak.stock_zh_a_spot()
+        elif market == 'HK':
+            df = ak.stock_hk_spot()
+        elif market == 'US':
+            df = ak.stock_us_spot()
+        else:
+            logger.error(f"未知市场类型: {market}")
+            return None
+        _market_cache[market] = {'data': df, 'timestamp': now}
+        logger.info(f"{market} 市场数据获取成功，行数: {len(df)}")
+        return df
+    except Exception as e:
+        logger.error(f"获取 {market} 市场数据失败: {e}")
+        if market in _market_cache:
+            logger.warning(f"使用过期缓存 {market} 市场数据")
+            return _market_cache[market]['data']
+        return None
+
+
+def get_stock_price(symbol):
+    """
+    从缓存的市场数据中提取股票实时价格
+    规则：
+      - 以 .HK 结尾 -> 港股
+      - 以 .US 结尾 -> 美股
+      - 否则视为A股（必须为6位数字代码）
+    """
+    try:
+        if symbol.endswith('.HK'):
+            market = 'HK'
+            code = symbol.replace('.HK', '').zfill(5)
+            df = get_market_data(market)
+            if df is None:
+                return None
+            row = df[df['代码'] == code]
+            if not row.empty:
+                price = float(row['最新价'].iloc[0])
+                logger.debug(f"提取 {symbol} 价格成功: {price}")
+                return price
+            else:
+                logger.warning(f"未找到港股代码 {code}")
+                return None
+        elif symbol.endswith('.US'):
+            market = 'US'
+            code = symbol.replace('.US', '')
+            df = get_market_data(market)
+            if df is None:
+                return None
+            # 尝试不同列名
+            if 'symbol' in df.columns:
+                row = df[df['symbol'] == code]
+            elif '代码' in df.columns:
+                row = df[df['代码'] == code]
+            else:
+                logger.error(f"美股数据无合适列名: {df.columns.tolist()}")
+                return None
+            if not row.empty:
+                if '最新价' in row.columns:
+                    price = float(row['最新价'].iloc[0])
+                elif 'price' in row.columns:
+                    price = float(row['price'].iloc[0])
+                else:
+                    logger.error(f"美股数据无价格列: {row.columns.tolist()}")
+                    return None
+                logger.debug(f"提取 {symbol} 价格成功: {price}")
+                return price
+            else:
+                logger.warning(f"未找到美股代码 {code}")
+                return None
+        else:
+            # A股
+            market = 'A'
+            code = symbol
+            df = get_market_data(market)
+            if df is None:
+                return None
+            row = df[df['代码'] == code]
+            if not row.empty:
+                price = float(row['最新价'].iloc[0])
+                logger.debug(f"提取 {symbol} 价格成功: {price}")
+                return price
+            else:
+                logger.warning(f"未找到A股代码 {code}")
+                return None
+    except Exception as e:
+        logger.error(f"提取 {symbol} 价格失败: {e}")
+        return None
+
+
+def get_top_losers(market):
+    """从缓存的市场数据中获取跌幅超过90%的股票列表"""
+    losers = []
+    try:
+        df = get_market_data(market)
+        if df is None:
+            return losers
+        if market == 'HK':
+            if '涨跌幅' in df.columns:
+                df_filtered = df[df['涨跌幅'] <= -90]
+                for _, row in df_filtered.iterrows():
+                    losers.append((row['代码'], row['涨跌幅']))
+                logger.info(f"港股跌幅榜筛选出 {len(losers)} 只跌幅>90%股票")
+            else:
+                logger.error(f"港股数据无涨跌幅列: {df.columns.tolist()}")
+        elif market == 'US':
+            pct_col = '涨跌幅' if '涨跌幅' in df.columns else 'percent'
+            if pct_col in df.columns:
+                df_filtered = df[df[pct_col] <= -90]
+                for _, row in df_filtered.iterrows():
+                    losers.append((row['symbol'], row[pct_col]))
+                logger.info(f"美股跌幅榜筛选出 {len(losers)} 只跌幅>90%股票")
+            else:
+                logger.error(f"美股数据无涨跌幅列: {df.columns.tolist()}")
+    except Exception as e:
+        logger.error(f"获取 {market} 跌幅榜失败: {e}")
+    return losers
+
+
+# ==================== 交易时间判断 ====================
+def get_current_time():
+    return datetime.now()
+
+
+def is_a_trading_time(dt=None):
+    """判断给定时间（北京时间）是否在A股交易时间内。A股交易时间：上午 9:30-11:30，下午 13:00-15:00"""
+    if dt is None:
+        dt = get_current_time()
+    if dt.weekday() >= 5:  # 周六周日
+        return False
+    morning_start = dt.replace(hour=9, minute=30, second=0, microsecond=0)
+    morning_end = dt.replace(hour=11, minute=30, second=0, microsecond=0)
+    afternoon_start = dt.replace(hour=13, minute=0, second=0, microsecond=0)
+    afternoon_end = dt.replace(hour=15, minute=0, second=0, microsecond=0)
+    return (morning_start <= dt <= morning_end) or (afternoon_start <= dt <= afternoon_end)
+
+
+def is_hk_trading_time(dt=None):
+    """判断给定时间（北京时间）是否在港股交易时间内"""
+    if dt is None:
+        dt = get_current_time()
+    if dt.weekday() >= 5:
+        return False
+    morning_start = dt.replace(hour=9, minute=30, second=0, microsecond=0)
+    morning_end = dt.replace(hour=12, minute=0, second=0, microsecond=0)
+    afternoon_start = dt.replace(hour=13, minute=0, second=0, microsecond=0)
+    afternoon_end = dt.replace(hour=16, minute=0, second=0, microsecond=0)
+    return (morning_start <= dt <= morning_end) or (afternoon_start <= dt <= afternoon_end)
+
+
+def is_us_trading_time(dt=None):
+    """判断给定时间（北京时间）是否在美股交易时间内（简化的夏令时判断）"""
+    if dt is None:
+        dt = get_current_time()
+    if dt.weekday() >= 5:
+        return False
+    year = dt.year
+    dst_start = datetime(year, 3, 8)
+    dst_end = datetime(year, 11, 1)
+    while dst_start.weekday() != 6:
+        dst_start = dst_start.replace(day=dst_start.day + 1)
+    while dst_end.weekday() != 6:
+        dst_end = dst_end.replace(day=dst_end.day + 1)
+    is_dst = dst_start <= dt <= dst_end
+
+    if is_dst:
+        us_open = dt.replace(hour=21, minute=30, second=0, microsecond=0)
+        us_close = (dt + timedelta(days=1)).replace(hour=4, minute=0, second=0, microsecond=0)
+    else:
+        us_open = dt.replace(hour=22, minute=30, second=0, microsecond=0)
+        us_close = (dt + timedelta(days=1)).replace(hour=5, minute=0, second=0, microsecond=0)
+
+    return us_open <= dt <= us_close
+
+
+# ==================== 弹窗提醒 ====================
+def show_alert(message):
+    logger.info(f"触发弹窗提醒: {message}")
+
+    def _alert():
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo("股价提醒", message)
+        root.destroy()
+
+    threading.Thread(target=_alert, daemon=True).start()
+
+
+# ==================== 提醒检查函数 ====================
+def check_price_alerts():
+    """检查到价提醒"""
+    global last_prices
+    alerts = PRICE_ALERTS.copy()
+    if not alerts:
+        logger.debug("到价提醒列表为空，跳过")
+        return
+    logger.info(f"开始检查到价提醒，监控 {len(alerts)} 只股票")
+
+    # 按市场分组
+    market_groups = {'A': [], 'HK': [], 'US': []}
+    for symbol in alerts.keys():
+        if symbol.endswith('.HK'):
+            market_groups['HK'].append(symbol)
+        elif symbol.endswith('.US'):
+            market_groups['US'].append(symbol)
+        else:
+            market_groups['A'].append(symbol)
+
+    now = get_current_time()
+    for market, symbols in market_groups.items():
+        if not symbols:
+            continue
+
+        # 判断交易时间
+        if market == 'A' and not is_a_trading_time(now):
+            logger.info(f"A股非交易时间，跳过该市场 {len(symbols)} 只股票的到价检查")
+            continue
+        if market == 'HK' and not is_hk_trading_time(now):
+            logger.info(f"港股非交易时间，跳过该市场 {len(symbols)} 只股票的到价检查")
+            continue
+        if market == 'US' and not is_us_trading_time(now):
+            logger.info(f"美股非交易时间，跳过该市场 {len(symbols)} 只股票的到价检查")
+            continue
+
+        # 获取该市场数据
+        df = get_market_data(market)
+        if df is None:
+            logger.warning(f"获取{market}市场数据失败，跳过该市场股票检查")
+            continue
+
+        # 对该市场中的每只股票进行检查
+        for symbol in symbols:
+            price = get_stock_price(symbol)
+            if price is None:
+                logger.warning(f"{symbol} 价格获取失败，跳过")
+                continue
+            logger.debug(f"{symbol} 当前价: {price}")
+            last_prices[symbol] = price
+            thresholds = alerts[symbol]
+            if thresholds.get('high') is not None and price >= thresholds['high']:
+                logger.info(f"{symbol} 触发高阈值提醒: {price} >= {thresholds['high']}")
+                show_alert(f"到价提醒：{symbol} 当前价 {price} >= 目标高 {thresholds['high']}")
+            if thresholds.get('low') is not None and price <= thresholds['low']:
+                logger.info(f"{symbol} 触发低阈值提醒: {price} <= {thresholds['low']}")
+                show_alert(f"到价提醒：{symbol} 当前价 {price} <= 目标低 {thresholds['low']}")
+    logger.info("到价提醒检查完成")
+
+
+def check_volatility_alerts():
+    """检查波动提醒"""
+    global last_prices
+    alerts = VOLATILITY_ALERTS.copy()
+    if not alerts:
+        logger.debug("波动提醒列表为空，跳过")
+        return
+    logger.info(f"开始检查波动提醒，监控 {len(alerts)} 只股票")
+
+    # 按市场分组
+    market_groups = {'A': [], 'HK': [], 'US': []}
+    for symbol in alerts.keys():
+        if symbol.endswith('.HK'):
+            market_groups['HK'].append(symbol)
+        elif symbol.endswith('.US'):
+            market_groups['US'].append(symbol)
+        else:
+            market_groups['A'].append(symbol)
+
+    now = get_current_time()
+    for market, symbols in market_groups.items():
+        if not symbols:
+            continue
+
+        if market == 'A' and not is_a_trading_time(now):
+            logger.info(f"A股非交易时间，跳过该市场 {len(symbols)} 只股票的波动检查")
+            continue
+        if market == 'HK' and not is_hk_trading_time(now):
+            logger.info(f"港股非交易时间，跳过该市场 {len(symbols)} 只股票的波动检查")
+            continue
+        if market == 'US' and not is_us_trading_time(now):
+            logger.info(f"美股非交易时间，跳过该市场 {len(symbols)} 只股票的波动检查")
+            continue
+
+        df = get_market_data(market)
+        if df is None:
+            logger.warning(f"获取{market}市场数据失败，跳过该市场股票检查")
+            continue
+
+        for symbol in symbols:
+            current = get_stock_price(symbol)
+            if current is None:
+                logger.warning(f"{symbol} 价格获取失败，跳过")
+                continue
+            previous = last_prices.get(symbol)
+            if previous is not None:
+                change_pct = (current - previous) / previous * 100
+                logger.debug(f"{symbol} 当前 {current}，上次 {previous}，变化 {change_pct:.2f}%")
+                if abs(change_pct) >= alerts[symbol]:
+                    direction = "上涨" if change_pct > 0 else "下跌"
+                    logger.info(f"{symbol} 触发波动提醒: 变化 {abs(change_pct):.2f}% >= {alerts[symbol]}%")
+                    show_alert(
+                        f"波动提醒：{symbol} 当前价 {current}，较上次 {previous} {direction} {abs(change_pct):.2f}%")
+            last_prices[symbol] = current
+    logger.info("波动提醒检查完成")
+
+
+def check_daily_losers():
+    """检查跌幅榜提醒"""
+    now = get_current_time()
+    logger.info("开始检查跌幅榜提醒")
+    if is_hk_trading_time(now):
+        losers_hk = get_top_losers('HK')
+        for sym, pct in losers_hk:
+            logger.info(f"港股跌幅榜触发提醒: {sym} 跌幅 {pct}%")
+            show_alert(f"港股跌幅榜提醒：{sym} 跌幅 {pct}% (超过90%)")
+    if is_us_trading_time(now):
+        losers_us = get_top_losers('US')
+        for sym, pct in losers_us:
+            logger.info(f"美股跌幅榜触发提醒: {sym} 跌幅 {pct}%")
+            show_alert(f"美股跌幅榜提醒：{sym} 跌幅 {pct}% (超过90%)")
+    logger.info("跌幅榜提醒检查完成")
+
+
+def job():
+    """定时任务：重新加载配置后执行检查"""
+    logger.info("========== 开始执行定时任务 ==========")
+    load_config()  # 每次运行前重新加载配置，确保最新设置
+    check_price_alerts()
+    check_volatility_alerts()
+    check_daily_losers()
+    logger.info("========== 定时任务执行完成 ==========")
+
+
+# ==================== 启动控制 ====================
+_checker_thread = None
+_stop_event = threading.Event()
+
+
+def _run_schedule():
+    """在单独线程中运行 schedule 循环"""
+    schedule.every(5).minutes.do(job)
+    # 立即执行一次，便于启动后快速检查
+    job()
+    while not _stop_event.is_set():
+        schedule.run_pending()
+        time.sleep(1)
+    logger.info("检查器线程停止")
+
+
+def start_checker():
+    """启动后台提醒检查线程（如果未启动）"""
+    global _checker_thread, _stop_event
+    if _checker_thread is not None and _checker_thread.is_alive():
+        logger.warning("检查器已在运行")
+        return
+    _stop_event.clear()
+    _checker_thread = threading.Thread(target=_run_schedule, daemon=True)
+    _checker_thread.start()
+    logger.info("后台检查器已启动")
+
+
+def stop_checker():
+    """停止后台提醒检查线程"""
+    global _stop_event
+    _stop_event.set()
+    logger.info("发送停止信号，等待检查器线程结束...")
+    # 线程会在下一次 sleep 后退出
+
+
+# 如果直接运行此模块，启动检查器（便于独立测试）
+if __name__ == "__main__":
+    start_checker()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        stop_checker()
