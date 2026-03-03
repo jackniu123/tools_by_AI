@@ -5,6 +5,9 @@ import signal
 import sys
 import os
 import winreg  # 用于操作 Windows 注册表
+import stock_price_alert.alert_checker
+import proxy_finder.proxy_finder
+import new_stock_monitor.new_stock_monitor
 
 def add_to_startup():
     """
@@ -25,7 +28,6 @@ def add_to_startup():
 def run_proxy_finder():
     """在独立线程中运行代理查找程序"""
     try:
-        import proxy_finder.proxy_finder
         proxy_finder.proxy_finder.main()
     except Exception as e:
         print(f"代理查找程序异常退出: {e}")
@@ -33,7 +35,6 @@ def run_proxy_finder():
 def run_new_stock_monitor():
     """在独立线程中运行新股监控程序"""
     try:
-        import new_stock_monitor.new_stock_monitor
         new_stock_monitor.new_stock_monitor.main()
     except Exception as e:
         print(f"新股监控程序异常退出: {e}")
@@ -41,7 +42,6 @@ def run_new_stock_monitor():
 def run_price_alert_checker():
     """在独立线程中运行股价提醒检查器（该函数内部已创建独立线程）"""
     try:
-        import stock_price_alert.alert_checker
         stock_price_alert.alert_checker.start_checker()
     except Exception as e:
         print(f"股价提醒检查器启动失败: {e}")
