@@ -19,8 +19,6 @@ import os
 import json
 import datetime
 import subprocess
-import sys
-import winreg
 import tkinter as tk
 from tkinter import scrolledtext, messagebox, filedialog
 import logging
@@ -171,93 +169,6 @@ def get_next_week_workdays(today):
     return next_week
 
 # ==================== 数据源函数 ====================
-
-def fetch_from_eastmoney_json():
-    """
-    从东方财富数据中心 JSON 接口获取新股新债数据
-    返回 DataFrame 或 None
-    """
-    result = pd.DataFrame()
-    try:
-        # ---- 新股接口 ----
-        url_stock = "http://datacenter.eastmoney.com/api/data/get"
-        params_stock = {
-            "type": "RPTA_WEB_IPOLIST",
-            "sty": "ALL",
-            "source": "WEB",
-            "p": 1,
-            "ps": 200,
-            "st": "apply_date",
-            "sr": -1
-        }
-        logging.info("尝试从东方财富 JSON 接口获取新股...")
-        resp = requests.get(url_stock, params=params_stock, headers=HEADERS, timeout=10)
-        resp.encoding = 'utf-8'
-        data = resp.json()
-
-        if data.get('code') == 0 and data.get('result'):
-            stock_list = data['result']['data']
-            if stock_list:
-                df_stock = pd.DataFrame(stock_list)
-                logging.info(f"新股 JSON 原始列名: {list(df_stock.columns)}")
-                name_col = 'SECURITY_SHORT_NAME'
-                code_col = 'SECURITY_CODE'
-                date_col = 'APPLY_DATE'
-                if name_col in df_stock.columns and code_col in df_stock.columns and date_col in df_stock.columns:
-                    df_stock = df_stock[[name_col, code_col, date_col]].copy()
-                    df_stock.rename(columns={name_col: '名称', code_col: '代码', date_col: '日期'}, inplace=True)
-                    df_stock['类型'] = '新股'
-                    before = len(df_stock)
-                    df_stock = df_stock[~df_stock['代码'].astype(str).str.startswith(BEIJING_PREFIXES)]
-                    df_stock['日期'] = pd.to_datetime(df_stock['日期']).dt.date
-                    result = pd.concat([result, df_stock], ignore_index=True)
-                    logging.info(f"新股 JSON 处理完成，原始 {before} 条，过滤后 {len(df_stock)} 条")
-                else:
-                    logging.warning(f"新股 JSON 缺少必要列，当前列: {list(df_stock.columns)}")
-
-        # ---- 可转债接口 ----
-        url_bond = "http://datacenter.eastmoney.com/api/data/get"
-        params_bond = {
-            "type": "RPTA_WEB_BOND_CB_LIST",
-            "sty": "ALL",
-            "source": "WEB",
-            "p": 1,
-            "ps": 200,
-            "st": "report_date",
-            "sr": -1
-        }
-        logging.info("尝试从东方财富 JSON 接口获取可转债...")
-        resp = requests.get(url_bond, params=params_bond, headers=HEADERS, timeout=10)
-        data = resp.json()
-        if data.get('code') == 0 and data.get('result'):
-            bond_list = data['result']['data']
-            if bond_list:
-                df_bond = pd.DataFrame(bond_list)
-                logging.info(f"可转债 JSON 原始列名: {list(df_bond.columns)}")
-                name_col = 'BOND_SHORT_NAME'
-                code_col = 'BOND_CODE'
-                date_col = 'APPLY_DATE'
-                if name_col in df_bond.columns and code_col in df_bond.columns and date_col in df_bond.columns:
-                    df_bond = df_bond[[name_col, code_col, date_col]].copy()
-                    df_bond.rename(columns={name_col: '名称', code_col: '代码', date_col: '日期'}, inplace=True)
-                    df_bond['类型'] = '新债'
-                    df_bond['日期'] = pd.to_datetime(df_bond['日期']).dt.date
-                    result = pd.concat([result, df_bond], ignore_index=True)
-                    logging.info(f"可转债 JSON 处理完成，共 {len(df_bond)} 条")
-                else:
-                    logging.warning(f"可转债 JSON 缺少必要列，当前列: {list(df_bond.columns)}")
-
-    except Exception as e:
-        logging.error(f"东方财富 JSON 接口抓取失败: {e}\n{traceback.format_exc()}")
-        return None
-
-    if not result.empty:
-        logging.info(f"东方财富 JSON 接口共获取 {len(result)} 条数据")
-        return result
-    else:
-        logging.warning("东方财富 JSON 接口未返回有效数据")
-        return None
-
 
 def fetch_from_10jqka_stock_json():
     """
@@ -738,7 +649,6 @@ def get_new_issues():
     返回 (DataFrame, logs列表)
     """
     sources = [
-        ("东方财富 JSON", fetch_from_eastmoney_json),
         ("同花顺", fetch_from_10jqka_combined),
         ("新浪网新股", fetch_from_sina_stock),
         ("东方财富日历数据", fetch_from_eastmoney_calendar),
@@ -909,25 +819,6 @@ def show_reminder(issues, title, logs, on_snooze=None):
     logging.info("提醒弹窗已关闭")
 
 
-def add_to_startup():
-    """将当前程序添加到 HKCU 开机启动项"""
-    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as regkey:
-            script_path = os.path.abspath(sys.argv[0])
-            if script_path.endswith('.py'):
-                pythonw = sys.executable.replace('python.exe', 'pythonw.exe')
-                if not os.path.exists(pythonw):
-                    pythonw = sys.executable
-                command = f'"{pythonw}" "{script_path}"'
-            else:
-                command = f'"{script_path}"'
-            winreg.SetValueEx(regkey, "StockAssistant", 0, winreg.REG_SZ, command)
-        logging.info("已添加到开机启动项")
-    except Exception as e:
-        logging.error(f"添加开机启动失败: {e}")
-
-
 # ==================== 主逻辑 ====================
 def main():
     setup_logging()
@@ -935,8 +826,6 @@ def main():
     logging.info("股票助手启动")
 
     try:
-        add_to_startup()
-
         state = load_state()
         today = datetime.date.today()
         logging.info(f"当前日期: {today.isoformat()}")

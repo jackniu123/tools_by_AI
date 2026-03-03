@@ -3,6 +3,24 @@ import threading
 import time
 import signal
 import sys
+import os
+import winreg  # 用于操作 Windows 注册表
+
+def add_to_startup():
+    """
+    将当前程序添加到 Windows 开机启动项（使用 python.exe 以显示控制台）
+    """
+    key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as regkey:
+            script_path = os.path.abspath(sys.argv[0])
+            # 使用 python.exe 而不是 pythonw.exe，以便显示控制台窗口
+            python_exe = sys.executable  # 通常是 python.exe 的路径
+            command = f'"{python_exe}" "{script_path}"'
+            winreg.SetValueEx(regkey, "EveryDayAssistant", 0, winreg.REG_SZ, command)
+        print("已成功添加到开机启动项")
+    except Exception as e:
+        print(f"添加开机启动失败: {e}")
 
 def run_proxy_finder():
     """在独立线程中运行代理查找程序"""
@@ -29,6 +47,9 @@ def run_price_alert_checker():
         print(f"股价提醒检查器启动失败: {e}")
 
 if __name__ == '__main__':
+    # 添加开机启动（首次运行或需要更新时调用）
+    add_to_startup()
+
     # 创建并启动三个线程
     threads = []
     t1 = threading.Thread(target=run_proxy_finder, daemon=True)
@@ -58,4 +79,3 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         print("\n程序终止")
         sys.exit(0)
-
