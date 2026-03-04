@@ -41,7 +41,7 @@ CACHE_EXPIRE_DAYS = 1  # 缓存有效期（天）
 BEIJING_PREFIXES = ('8', '43', '83', '87', '88', '920')
 
 # 每周提醒日（0=周一，4=周五）
-WEEKLY_REMINDER_WEEKDAY = 4
+WEEKLY_REMINDER_WEEKDAY = 0
 
 # 证券软件常见安装路径（备选）
 SOFTWARE_PATHS = {
@@ -225,6 +225,25 @@ def fetch_from_10jqka_stock_json():
             return None
 
         df = pd.DataFrame(records)
+
+        # 处理日期列：先标准化为 YYYY-MM-DD
+        def normalize_date(date_str):
+            # 如果已经是 YYYY-MM-DD 格式，直接返回
+            if re.match(r'\d{4}-\d{2}-\d{2}', date_str):
+                return date_str
+            # 尝试匹配 MM-DD 格式（可能后面有中文星期）
+            match = re.match(r'(\d{2})-(\d{2})', date_str)
+            if match:
+                month, day = match.groups()
+                year = datetime.datetime.now().year  # 假设是当前年份
+                return f"{year}-{month}-{day}"
+            # 无法解析则返回 None
+            return None
+
+        df['日期'] = df['日期'].apply(normalize_date)
+        # 过滤掉无法解析的日期
+        df = df.dropna(subset=['日期'])
+
         before = len(df)
         df = df[~df['代码'].astype(str).str.startswith(BEIJING_PREFIXES)]
         df['日期'] = pd.to_datetime(df['日期']).dt.date
@@ -454,6 +473,13 @@ def fetch_from_sina_stock():
                 break
 
             df = tables[0].copy()
+            df = df.iloc[:, :-1]
+            df = df[1:]
+            df.columns = df.iloc[0].values
+
+            # 删除原来的第二行（索引为1）
+            df = df.drop(index=1).reset_index(drop=True)
+
             # 清理列名中的HTML标签和换行
             df.columns = [str(col).replace('\n', '').replace('<br>', '').strip() for col in df.columns]
             logging.info(f"新浪网第 {page} 页原始列名: {list(df.columns)}")
@@ -468,7 +494,7 @@ def fetch_from_sina_stock():
                     name_col = col
                 if '证券代码' in col or '代码' in col_lower:
                     code_col = col
-                if '上网发行日期' in col or '发行日期' in col_lower:
+                if '上网发行' in col and '日期' in col_lower:
                     date_col = col
 
             if name_col and code_col and date_col:
@@ -487,6 +513,7 @@ def fetch_from_sina_stock():
             if '下一页' not in resp.text or 'disabled' in resp.text:
                 break
             page += 1
+            break
 
         if not all_records:
             logging.warning("新浪网未抓取到任何数据")
