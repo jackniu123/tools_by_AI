@@ -220,7 +220,7 @@ def get_stock_price(symbol):
             df = get_market_data(market)
             if df is None:
                 return None
-            row = df[df['代码'] == code]
+            row = df[df['代码'].str[2:] == code]
             if not row.empty:
                 price = float(row['最新价'].iloc[0])
                 logger.debug(f"提取 {symbol} 价格成功: {price}")
