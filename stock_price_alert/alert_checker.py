@@ -21,10 +21,8 @@ from tkinter import messagebox
 LOG_DIR = r"C:\Users\Administrator\stock_price_alert"
 LOG_FILE = os.path.join(LOG_DIR, "alert_checker.log")
 
-# 确保日志目录存在
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# 创建 logger
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -45,6 +43,11 @@ PRICE_ALERTS = {}  # 格式: {symbol: {"name": str, "high": float, "low": float}
 VOLATILITY_ALERTS = {}  # 格式: {symbol: {"name": str, "threshold": float}}
 last_prices = {}  # 存储上一次价格，用于波动计算
 _market_cache = {}  # 市场数据缓存
+
+# 今日屏蔽记录
+_blocked_today = set()          # 存储当天已屏蔽的提醒键
+_blocked_date = datetime.now().date()  # 记录当前日期，用于每天重置
+_blocked_lock = threading.Lock()       # 保护屏蔽集合的线程锁
 
 
 # ==================== 配置加载 ====================
@@ -318,15 +321,68 @@ def is_us_trading_time(dt=None):
     return us_open <= dt <= us_close
 
 
-# ==================== 弹窗提醒 ====================
-def show_alert(message):
-    logger.info(f"触发弹窗提醒: {message}")
+# ==================== 弹窗提醒（支持今日不再提醒）====================
+def show_alert(message, key):
+    """
+    显示自定义提醒弹窗，包含“今日不再提醒”按钮。
+    :param message: 要显示的消息文本
+    :param key: 唯一标识该提醒的键，用于日内屏蔽
+    """
+    global _blocked_today, _blocked_date, _blocked_lock
+
+    # 检查当前日期，若已过午夜则清空屏蔽记录
+    with _blocked_lock:
+        today = datetime.now().date()
+        if today != _blocked_date:
+            _blocked_today.clear()
+            _blocked_date = today
+            logger.info("日期变化，清空今日屏蔽记录")
+
+        if key in _blocked_today:
+            logger.info(f"提醒已被用户屏蔽今日不再弹: {key}")
+            return
+
+    logger.info(f"触发弹窗提醒 (key={key}): {message}")
 
     def _alert():
+        # 在子线程中创建弹窗
         root = tk.Tk()
-        root.withdraw()
-        messagebox.showinfo("股价提醒", message)
-        root.destroy()
+        root.withdraw()  # 隐藏主窗口
+        top = tk.Toplevel(root)
+        top.title("股价提醒")
+        top.geometry("400x150")
+        top.attributes('-topmost', True)  # 置顶
+        top.focus_force()  # 获取焦点
+
+        # 消息标签
+        msg_label = tk.Label(top, text=message, wraplength=380, justify='left')
+        msg_label.pack(pady=10, padx=10)
+
+        # 按钮框架
+        btn_frame = tk.Frame(top)
+        btn_frame.pack(pady=10)
+
+        def on_close():
+            top.destroy()
+            root.destroy()
+
+        def on_snooze():
+            # 用户选择“今日不再提醒”，将该键加入屏蔽集合
+            with _blocked_lock:
+                _blocked_today.add(key)
+                logger.info(f"用户屏蔽今日提醒: {key}")
+            top.destroy()
+            root.destroy()
+
+        btn_close = tk.Button(btn_frame, text="关闭", command=on_close, width=12)
+        btn_close.pack(side=tk.LEFT, padx=5)
+
+        btn_snooze = tk.Button(btn_frame, text="今日不再提醒", command=on_snooze, width=15)
+        btn_snooze.pack(side=tk.LEFT, padx=5)
+
+        top.protocol("WM_DELETE_WINDOW", on_close)  # 点击X时也执行关闭
+
+        root.mainloop()
 
     threading.Thread(target=_alert, daemon=True).start()
 
@@ -384,10 +440,13 @@ def check_price_alerts():
             thresholds = alerts[symbol]
             if thresholds.get('high') is not None and price >= thresholds['high']:
                 logger.info(f"{symbol} 触发高阈值提醒: {price} >= {thresholds['high']}")
-                show_alert(f"到价提醒：{symbol} 当前价 {price} >= 目标高 {thresholds['high']}")
+                # 构造唯一键，包含股票、类型和阈值，以便精确屏蔽
+                key = f"price_high:{symbol}:{thresholds['high']}"
+                show_alert(f"到价提醒：{symbol} 当前价 {price} >= 目标高 {thresholds['high']}", key)
             if thresholds.get('low') is not None and price <= thresholds['low']:
                 logger.info(f"{symbol} 触发低阈值提醒: {price} <= {thresholds['low']}")
-                show_alert(f"到价提醒：{symbol} 当前价 {price} <= 目标低 {thresholds['low']}")
+                key = f"price_low:{symbol}:{thresholds['low']}"
+                show_alert(f"到价提醒：{symbol} 当前价 {price} <= 目标低 {thresholds['low']}", key)
     logger.info("到价提醒检查完成")
 
 
@@ -455,8 +514,10 @@ def check_volatility_alerts():
                 if abs(change_pct) >= threshold:
                     direction = "上涨" if change_pct > 0 else "下跌"
                     logger.info(f"{symbol} 触发波动提醒: 变化 {abs(change_pct):.2f}% >= {threshold}%")
+                    key = f"volatility:{symbol}"
                     show_alert(
-                        f"波动提醒：{symbol} 当前价 {current}，较上次 {previous} {direction} {abs(change_pct):.2f}%")
+                        f"波动提醒：{symbol} 当前价 {current}，较上次 {previous} {direction} {abs(change_pct):.2f}%",
+                        key)
             last_prices[symbol] = current
     logger.info("波动提醒检查完成")
 
@@ -469,12 +530,14 @@ def check_daily_losers():
         losers_hk = get_top_losers('HK')
         for sym, pct in losers_hk:
             logger.info(f"港股跌幅榜触发提醒: {sym} 跌幅 {pct}%")
-            show_alert(f"港股跌幅榜提醒：{sym} 跌幅 {pct}% (超过90%)")
+            key = f"loser:HK:{sym}"
+            show_alert(f"港股跌幅榜提醒：{sym} 跌幅 {pct}% (超过90%)", key)
     if is_us_trading_time(now):
         losers_us = get_top_losers('US')
         for sym, pct in losers_us:
             logger.info(f"美股跌幅榜触发提醒: {sym} 跌幅 {pct}%")
-            show_alert(f"美股跌幅榜提醒：{sym} 跌幅 {pct}% (超过90%)")
+            key = f"loser:US:{sym}"
+            show_alert(f"美股跌幅榜提醒：{sym} 跌幅 {pct}% (超过90%)", key)
     logger.info("跌幅榜提醒检查完成")
 
 

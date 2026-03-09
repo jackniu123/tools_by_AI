@@ -3,7 +3,6 @@
 股票助手 - 打新日历提醒工具
 功能：
 - 每日强提醒：下两个工作日（含今天）新股新债，弹窗带“今日不再提醒”按钮
-- 自动打开证券软件：当日有申购时，自动启动东方财富和国泰海通（可配置路径）
 - 每周预告：每周五提醒下周所有工作日新股新债
 - 多源数据获取（东方财富JSON/同花顺JSON+API/新浪网/东方财富日历数据/缓存）
 - 汇总所有成功数据源的结果，去重后展示
@@ -872,9 +871,7 @@ def main():
             # 检查是否已设置今日不再提醒
             if state.get('daily_reminder_date') != today.isoformat():
                 logging.info(f"触发每日提醒，共 {len(daily_issues)} 条")
-                # 自动打开证券软件（如果尚未配置路径，会弹出选择对话框）
-                open_software('东方财富')
-                open_software('国泰海通')
+                # 注：自动打开证券软件功能已移除，仅保留按钮打开
                 def snooze_daily():
                     state['daily_reminder_date'] = today.isoformat()
                     save_state(state)
