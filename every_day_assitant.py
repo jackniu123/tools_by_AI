@@ -41,12 +41,11 @@ def create_desktop_shortcut():
         script_path = os.path.abspath(sys.argv[0])
 
         # 生成批处理文件内容
-        # @echo off 可隐藏命令回显，如果不希望隐藏可以去掉
         bat_content = f'''@echo off
 "{python_exe}" "{script_path}"
 '''
-        # 写入文件
-        with open(shortcut_path, 'w', encoding='utf-8') as f:
+        # 以 GBK 编码写入文件（解决中文路径乱码）
+        with open(shortcut_path, 'w', encoding='gbk') as f:
             f.write(bat_content)
 
         print(f"桌面快捷方式已创建: {shortcut_path}")
