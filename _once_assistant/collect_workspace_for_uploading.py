@@ -12,11 +12,10 @@ import argparse
 # 默认包含的文件扩展名（可根据项目调整）
 DEFAULT_INCLUDE_EXTS = {
     '.java', '.kt', '.xml', '.gradle', '.properties', '.txt',
-    '.md', '.cfg', '.conf', '.json', '.yaml', '.yml', '.gradle.kts'
+    '.md', '.cfg', '.conf', '.json', '.yaml', '.yml', '.kts'
 }
 
 # 默认排除的目录名（匹配任意路径段）
-# 添加了 'release', 'test', 'androidTest' 以避免汇总编译结果和测试文件
 DEFAULT_EXCLUDE_DIRS = {
     'build', '.gradle', '.idea', '.git', '.svn', 'out', 'bin', 'gen',
     'captures', '.settings', 'gradle', 'wrapper', '.cxx', 'release',
@@ -32,39 +31,41 @@ DEFAULT_EXCLUDE_EXTS = {
 
 def should_exclude(path, root, include_exts=None, exclude_dirs=None, exclude_exts=None):
     """
-    判断文件是否应被排除
+    判断文件是否应被排除，并返回排除原因。
     :param path: 文件的完整路径
     :param root: 遍历的根目录（用于计算相对路径）
     :param include_exts: 包含的扩展名集合（若指定，则不在其中的文件排除）
     :param exclude_dirs: 排除的目录名集合
-    :param exclude_exts: 排除的扩展名集合（与 include_exts 二选一，通常用 include 更安全）
-    :return: True 表示排除，False 表示保留
+    :param exclude_exts: 排除的扩展名集合（与 include_exts 二选一）
+    :return: (True/False, reason_string or None)
     """
     rel_path = os.path.relpath(path, root)
     parts = rel_path.split(os.sep)
 
     # 检查路径中是否有排除目录
     if exclude_dirs:
-        for part in parts[:-1]:  # 排除目录只检查除文件名以外的部分
+        for part in parts[:-1]:  # 只检查目录部分
             if part in exclude_dirs:
-                return True
+                return True, f"匹配排除目录 '{part}'"
 
     # 如果是文件，检查扩展名
     if os.path.isfile(path):
         ext = os.path.splitext(path)[1].lower()
         # 如果指定了包含扩展名，则只保留这些扩展名
         if include_exts is not None:
-            return ext not in include_exts
+            if ext not in include_exts:
+                return True, f"扩展名 '{ext}' 不在包含列表中"
         # 如果指定了排除扩展名，则排除这些扩展名
         elif exclude_exts is not None:
-            return ext in exclude_exts
+            if ext in exclude_exts:
+                return True, f"扩展名 '{ext}' 在排除列表中"
 
-    # 默认保留（目录本身不作为输出内容）
-    return False
+    # 默认保留
+    return False, None
 
-def collect_files(root_dir, include_exts=None, exclude_dirs=None, exclude_exts=None):
+def collect_files(root_dir, include_exts=None, exclude_dirs=None, exclude_exts=None, show_excluded=True):
     """
-    遍历目录，收集符合条件的文件路径
+    遍历目录，收集符合条件的文件路径，并可选择性地打印被排除的文件信息。
     :return: 生成器，产生 (相对路径, 绝对路径)
     """
     for root, dirs, files in os.walk(root_dir):
@@ -74,8 +75,12 @@ def collect_files(root_dir, include_exts=None, exclude_dirs=None, exclude_exts=N
 
         for file in files:
             file_path = os.path.join(root, file)
-            if not should_exclude(file_path, root_dir, include_exts, exclude_dirs, exclude_exts):
-                rel_path = os.path.relpath(file_path, root_dir)
+            excluded, reason = should_exclude(file_path, root_dir, include_exts, exclude_dirs, exclude_exts)
+            rel_path = os.path.relpath(file_path, root_dir)
+            if excluded:
+                if show_excluded:
+                    print(f"排除: {rel_path} 原因: {reason}")
+            else:
                 yield rel_path, file_path
 
 def write_summary(output_file, root_dir, file_generator):
@@ -117,6 +122,8 @@ def main():
                         help='要排除的目录名列表（例如 build .gradle），若不指定则使用默认集合')
     parser.add_argument('--exclude-exts', nargs='+', default=None,
                         help='要排除的文件扩展名列表（例如 .class .dex），通常与 --include-exts 互斥')
+    parser.add_argument('--show-excluded', action=argparse.BooleanOptionalAction, default=True,
+                        help='是否显示被排除的文件信息（默认显示）')
     args = parser.parse_args()
 
     # 处理参数默认值
@@ -135,7 +142,7 @@ def main():
         sys.exit(1)
 
     print(f"正在扫描目录: {args.project_dir}")
-    file_generator = collect_files(args.project_dir, include_exts, exclude_dirs, exclude_exts)
+    file_generator = collect_files(args.project_dir, include_exts, exclude_dirs, exclude_exts, args.show_excluded)
     write_summary(args.output, args.project_dir, file_generator)
 
 if __name__ == '__main__':
