@@ -12,7 +12,8 @@ import argparse
 # 默认包含的文件扩展名（可根据项目调整）
 DEFAULT_INCLUDE_EXTS = {
     '.java', '.kt', '.xml', '.gradle', '.properties', '.txt',
-    '.md', '.cfg', '.conf', '.json', '.yaml', '.yml', '.kts'
+    '.md', '.cfg', '.conf', '.json', '.yaml', '.yml', '.kts',
+    '.html'
 }
 
 # 默认排除的目录名（匹配任意路径段）
