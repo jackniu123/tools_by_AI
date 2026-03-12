@@ -2,12 +2,12 @@
 """
 股票助手 - 打新日历提醒工具
 功能：
-- 每日强提醒：下两个工作日（含今天）新股新债，弹窗带“今日不再提醒”按钮
+- 每日强提醒：若未来一周内有新股新债，则展示所有未来可申购的股票，并显示剩余天数
 - 每周预告：每周五提醒下周所有工作日新股新债
 - 多源数据获取（东方财富JSON/同花顺JSON+API/新浪网/东方财富日历数据/缓存）
 - 汇总所有成功数据源的结果，去重后展示
 - 弹窗中新股和新债分组显示，每组按申购日期排序
-- 今日申购的条目用红色高亮
+- 今日申购的条目用红色高亮，每条记录显示剩余天数
 - 弹窗底部显示各数据源获取状态
 - 含一键打开东方财富/国泰海通证券（手动）
 - 自动添加开机启动
@@ -754,7 +754,7 @@ def open_software(software_name):
 
 def show_reminder(issues, title, logs, on_snooze=None):
     """
-    显示提醒弹窗，按新股/新债分组，每组内按申购日期排序
+    显示提醒弹窗，按新股/新债分组，每组内按申购日期排序，并显示剩余天数
     """
     logging.info(f"显示提醒弹窗: {title}，包含 {len(issues)} 条记录")
     today = datetime.date.today()
@@ -779,7 +779,7 @@ def show_reminder(issues, title, logs, on_snooze=None):
 
     root = tk.Tk()
     root.title(title)
-    root.geometry("650x500")
+    root.geometry("700x550")
     root.attributes('-topmost', True)
 
     # 新股列表区域
@@ -789,20 +789,30 @@ def show_reminder(issues, title, logs, on_snooze=None):
     list_label = tk.Label(list_frame, text="新股新债列表", font=('微软雅黑', 10, 'bold'))
     list_label.pack(anchor='w')
 
-    list_text = scrolledtext.ScrolledText(list_frame, wrap=tk.WORD, font=('微软雅黑', 10), height=10)
+    list_text = scrolledtext.ScrolledText(list_frame, wrap=tk.WORD, font=('微软雅黑', 10), height=12)
     list_text.pack(fill=tk.BOTH, expand=True)
 
     # 配置标签样式
     list_text.tag_config('red', foreground='red')
     list_text.tag_config('bold', font=('微软雅黑', 10, 'bold'))
 
-    # 逐行插入，分组
+    # 逐行插入，分组，并计算剩余天数
     current_type = None
     for _, row in issues_sorted.iterrows():
         if row['类型'] != current_type:
             current_type = row['类型']
             list_text.insert(tk.END, f"\n--- {current_type} ---\n", 'bold')
-        line = f"{row['类型']}: {row['名称']} ({row['代码']}) 申购日: {row['日期']}\n"
+
+        # 计算剩余天数
+        days_remaining = (row['日期'] - today).days
+        if days_remaining == 0:
+            days_str = "今日申购"
+        elif days_remaining > 0:
+            days_str = f"剩余{days_remaining}天"
+        else:
+            days_str = "已过期"  # 理论上不会出现，因为传入的应是未来数据，但以防万一
+
+        line = f"{row['类型']}: {row['名称']} ({row['代码']}) 申购日: {row['日期']} ({days_str})\n"
         if row['日期'] == today:
             list_text.insert(tk.END, line, 'red')
         else:
@@ -862,25 +872,27 @@ def main():
             # 可考虑弹窗提示无数据？此处保持静默退出
             return
 
-        # 每日强提醒：下两个工作日（包含今天）
-        next_two = get_next_workdays(today, 2)
-        daily_mask = issues['日期'].isin(next_two)
-        daily_issues = issues[daily_mask]
-
-        if not daily_issues.empty:
+        # 每日强提醒：若未来一周内有新股新债，则展示所有未来可申购的（日期≥今天）
+        next_week_dates = [today + datetime.timedelta(days=i) for i in range(7)]
+        has_next_week = issues['日期'].isin(next_week_dates).any()
+        if has_next_week:
             # 检查是否已设置今日不再提醒
             if state.get('daily_reminder_date') != today.isoformat():
-                logging.info(f"触发每日提醒，共 {len(daily_issues)} 条")
-                # 注：自动打开证券软件功能已移除，仅保留按钮打开
-                def snooze_daily():
-                    state['daily_reminder_date'] = today.isoformat()
-                    save_state(state)
-                    logging.info("用户点击今日不再提醒，状态已保存")
-                show_reminder(daily_issues, "打新强提醒：下两个工作日新股新债", source_logs, on_snooze=snooze_daily)
+                # 筛选所有未来可申购的记录（日期 >= 今天）
+                future_issues = issues[issues['日期'] >= today].copy()
+                if not future_issues.empty:
+                    logging.info(f"触发每日提醒（未来一周有新股），展示所有未来 {len(future_issues)} 条记录")
+                    def snooze_daily():
+                        state['daily_reminder_date'] = today.isoformat()
+                        save_state(state)
+                        logging.info("用户点击今日不再提醒，状态已保存")
+                    show_reminder(future_issues, "打新强提醒：未来可申购新股新债", source_logs, on_snooze=snooze_daily)
+                else:
+                    logging.info("无未来可申购记录，跳过每日提醒")
             else:
                 logging.info("今日已设置不再提醒，跳过每日提醒")
         else:
-            logging.info("今日无下两个工作日新股新债")
+            logging.info("今日无未来一周新股新债，不触发每日提醒")
 
         # 每周预告：若今天是指定提醒日，提示下周所有工作日
         if today.weekday() == WEEKLY_REMINDER_WEEKDAY:
