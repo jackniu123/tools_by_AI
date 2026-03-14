@@ -438,15 +438,26 @@ def check_price_alerts():
             logger.debug(f"{symbol} 当前价: {price}")
             last_prices[symbol] = price
             thresholds = alerts[symbol]
-            if thresholds.get('high') is not None and price >= thresholds['high']:
-                logger.info(f"{symbol} 触发高阈值提醒: {price} >= {thresholds['high']}")
-                # 构造唯一键，包含股票、类型和阈值，以便精确屏蔽
-                key = f"price_high:{symbol}:{thresholds['high']}"
-                show_alert(f"到价提醒：{symbol} 当前价 {price} >= 目标高 {thresholds['high']}", key)
-            if thresholds.get('low') is not None and price <= thresholds['low']:
-                logger.info(f"{symbol} 触发低阈值提醒: {price} <= {thresholds['low']}")
-                key = f"price_low:{symbol}:{thresholds['low']}"
-                show_alert(f"到价提醒：{symbol} 当前价 {price} <= 目标低 {thresholds['low']}", key)
+            name = thresholds.get('name', '')
+
+            # --- 新增日志：打印目标价格和当前价格（无论是否触发） ---
+            high = thresholds.get('high')
+            low = thresholds.get('low')
+            log_msg = f"股票 {symbol} ({name}) 当前价格: {price}"
+            if high is not None:
+                log_msg += f", 高阈值: {high}"
+            if low is not None:
+                log_msg += f", 低阈值: {low}"
+            logger.info(log_msg)
+
+            if high is not None and price >= high:
+                logger.info(f"{symbol} 触发高阈值提醒: {price} >= {high}")
+                key = f"price_high:{symbol}:{high}"
+                show_alert(f"到价提醒：{symbol} 当前价 {price} >= 目标高 {high}", key)
+            if low is not None and price <= low:
+                logger.info(f"{symbol} 触发低阈值提醒: {price} <= {low}")
+                key = f"price_low:{symbol}:{low}"
+                show_alert(f"到价提醒：{symbol} 当前价 {price} <= 目标低 {low}", key)
     logger.info("到价提醒检查完成")
 
 
@@ -541,8 +552,17 @@ def check_daily_losers():
     logger.info("跌幅榜提醒检查完成")
 
 
+def is_trading_day(dt=None):
+    """判断给定时间（北京时间）是否为交易日（仅跳过周末）"""
+    if dt is None:
+        dt = get_current_time()
+    return dt.weekday() < 5
+
 def job():
     """定时任务：重新加载配置后执行检查"""
+    if not is_trading_day():
+        logger.info("今天是非交易日，跳过所有检查")
+        return
     logger.info("========== 开始执行定时任务 ==========")
     load_config()  # 每次运行前重新加载配置，确保最新设置
     check_price_alerts()
