@@ -337,15 +337,20 @@ def _create_alert_window(alerts):
     root.withdraw()
     top = tk.Toplevel(root)
     top.title("股价提醒")
-    top.geometry("450x200")
+    top.geometry("450x250")  # 增加高度确保按钮不被遮挡
     top.attributes('-topmost', True)
     top.focus_force()
 
-    # 消息显示区域（带滚动条，防止过长）
-    frame = tk.Frame(top)
-    frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-    text = tk.Text(frame, wrap=tk.WORD, height=8, font=("微软雅黑", 10))
-    scrollbar = tk.Scrollbar(frame, command=text.yview)
+    # 主框架，使用pack布局
+    main_frame = tk.Frame(top)
+    main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+    # 文本框框架（占用大部分空间）
+    text_frame = tk.Frame(main_frame)
+    text_frame.pack(fill=tk.BOTH, expand=True)
+
+    text = tk.Text(text_frame, wrap=tk.WORD, height=8, font=("微软雅黑", 10))
+    scrollbar = tk.Scrollbar(text_frame, command=text.yview)
     text.configure(yscrollcommand=scrollbar.set)
     scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
     text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -353,11 +358,11 @@ def _create_alert_window(alerts):
     # 插入所有消息
     for msg, _ in alerts:
         text.insert(tk.END, msg + "\n\n")
-    text.configure(state=tk.DISABLED)  # 只读
+    text.configure(state=tk.DISABLED)
 
-    # 按钮框架
-    btn_frame = tk.Frame(top)
-    btn_frame.pack(pady=10)
+    # 按钮框架（置于底部，不扩展）
+    btn_frame = tk.Frame(main_frame)
+    btn_frame.pack(fill=tk.X, pady=(10, 0))
 
     def on_close():
         global _alert_window, _pending_alerts
@@ -476,7 +481,7 @@ def check_price_alerts():
             thresholds = alerts[symbol]
             name = thresholds.get('name', '')
 
-            # --- 新增日志：打印目标价格和当前价格（无论是否触发） ---
+            # --- 打印股票名称、当前价格和目标价格到控制台（通过logger.info） ---
             high = thresholds.get('high')
             low = thresholds.get('low')
             log_msg = f"股票 {symbol} ({name}) 当前价格: {price}"
