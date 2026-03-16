@@ -49,6 +49,11 @@ _blocked_today = set()          # 存储当天已屏蔽的提醒键
 _blocked_date = datetime.now().date()  # 记录当前日期，用于每天重置
 _blocked_lock = threading.Lock()       # 保护屏蔽集合的线程锁
 
+# 弹窗合并相关
+_pending_alerts = []          # 存储尚未关闭的提醒 (message, key)
+_alert_window = None           # 当前弹窗窗口对象
+_alert_lock = threading.Lock() # 保护弹窗状态
+
 
 # ==================== 配置加载 ====================
 def load_config():
@@ -321,70 +326,101 @@ def is_us_trading_time(dt=None):
     return us_open <= dt <= us_close
 
 
-# ==================== 弹窗提醒（支持今日不再提醒）====================
+# ==================== 弹窗提醒（支持合并和今日不再提醒）====================
+def _create_alert_window(alerts):
+    """
+    根据给定的提醒列表创建新的弹窗。
+    alerts: list of (message, key)
+    """
+    global _alert_window
+    root = tk.Tk()
+    root.withdraw()
+    top = tk.Toplevel(root)
+    top.title("股价提醒")
+    top.geometry("450x200")
+    top.attributes('-topmost', True)
+    top.focus_force()
+
+    # 消息显示区域（带滚动条，防止过长）
+    frame = tk.Frame(top)
+    frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    text = tk.Text(frame, wrap=tk.WORD, height=8, font=("微软雅黑", 10))
+    scrollbar = tk.Scrollbar(frame, command=text.yview)
+    text.configure(yscrollcommand=scrollbar.set)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    # 插入所有消息
+    for msg, _ in alerts:
+        text.insert(tk.END, msg + "\n\n")
+    text.configure(state=tk.DISABLED)  # 只读
+
+    # 按钮框架
+    btn_frame = tk.Frame(top)
+    btn_frame.pack(pady=10)
+
+    def on_close():
+        global _alert_window, _pending_alerts
+        with _alert_lock:
+            _pending_alerts.clear()
+            _alert_window = None
+        top.destroy()
+        root.destroy()
+
+    def on_snooze():
+        global _alert_window, _pending_alerts, _blocked_today
+        with _alert_lock:
+            # 将所有提醒的key加入屏蔽集
+            for _, key in alerts:
+                _blocked_today.add(key)
+            _pending_alerts.clear()
+            _alert_window = None
+        top.destroy()
+        root.destroy()
+        logger.info(f"用户屏蔽今日提醒，共屏蔽 {len(alerts)} 条")
+
+    btn_close = tk.Button(btn_frame, text="关闭", command=on_close, width=12)
+    btn_close.pack(side=tk.LEFT, padx=5)
+    btn_snooze = tk.Button(btn_frame, text="今日不再提醒", command=on_snooze, width=15)
+    btn_snooze.pack(side=tk.LEFT, padx=5)
+
+    top.protocol("WM_DELETE_WINDOW", on_close)
+    _alert_window = top
+    root.mainloop()
+
+
 def show_alert(message, key):
     """
-    显示自定义提醒弹窗，包含“今日不再提醒”按钮。
-    :param message: 要显示的消息文本
-    :param key: 唯一标识该提醒的键，用于日内屏蔽
+    显示提醒弹窗（合并版本）
     """
-    global _blocked_today, _blocked_date, _blocked_lock
+    global _pending_alerts, _alert_window, _blocked_today, _blocked_date, _alert_lock
 
-    # 检查当前日期，若已过午夜则清空屏蔽记录
+    # 日期重置检查
     with _blocked_lock:
         today = datetime.now().date()
         if today != _blocked_date:
             _blocked_today.clear()
             _blocked_date = today
             logger.info("日期变化，清空今日屏蔽记录")
-
         if key in _blocked_today:
             logger.info(f"提醒已被用户屏蔽今日不再弹: {key}")
             return
 
-    logger.info(f"触发弹窗提醒 (key={key}): {message}")
+    with _alert_lock:
+        # 将新提醒加入待处理列表
+        _pending_alerts.append((message, key))
+        logger.info(f"待处理提醒数: {len(_pending_alerts)}")
 
-    def _alert():
-        # 在子线程中创建弹窗
-        root = tk.Tk()
-        root.withdraw()  # 隐藏主窗口
-        top = tk.Toplevel(root)
-        top.title("股价提醒")
-        top.geometry("400x150")
-        top.attributes('-topmost', True)  # 置顶
-        top.focus_force()  # 获取焦点
+        # 如果已有弹窗，先销毁（准备刷新）
+        if _alert_window is not None:
+            try:
+                _alert_window.destroy()
+            except:
+                pass
+            _alert_window = None
 
-        # 消息标签
-        msg_label = tk.Label(top, text=message, wraplength=380, justify='left')
-        msg_label.pack(pady=10, padx=10)
-
-        # 按钮框架
-        btn_frame = tk.Frame(top)
-        btn_frame.pack(pady=10)
-
-        def on_close():
-            top.destroy()
-            root.destroy()
-
-        def on_snooze():
-            # 用户选择“今日不再提醒”，将该键加入屏蔽集合
-            with _blocked_lock:
-                _blocked_today.add(key)
-                logger.info(f"用户屏蔽今日提醒: {key}")
-            top.destroy()
-            root.destroy()
-
-        btn_close = tk.Button(btn_frame, text="关闭", command=on_close, width=12)
-        btn_close.pack(side=tk.LEFT, padx=5)
-
-        btn_snooze = tk.Button(btn_frame, text="今日不再提醒", command=on_snooze, width=15)
-        btn_snooze.pack(side=tk.LEFT, padx=5)
-
-        top.protocol("WM_DELETE_WINDOW", on_close)  # 点击X时也执行关闭
-
-        root.mainloop()
-
-    threading.Thread(target=_alert, daemon=True).start()
+    # 在新线程中创建弹窗（避免阻塞定时任务）
+    threading.Thread(target=_create_alert_window, args=(_pending_alerts.copy(),), daemon=True).start()
 
 
 # ==================== 提醒检查函数 ====================
@@ -450,14 +486,17 @@ def check_price_alerts():
                 log_msg += f", 低阈值: {low}"
             logger.info(log_msg)
 
+            now_str = datetime.now().strftime('%H:%M:%S')
             if high is not None and price >= high:
                 logger.info(f"{symbol} 触发高阈值提醒: {price} >= {high}")
                 key = f"price_high:{symbol}:{high}"
-                show_alert(f"到价提醒：{symbol} 当前价 {price} >= 目标高 {high}", key)
+                msg = f"到价提醒 [{now_str}]：{symbol} ({name}) 当前价 {price} >= 目标高 {high}"
+                show_alert(msg, key)
             if low is not None and price <= low:
                 logger.info(f"{symbol} 触发低阈值提醒: {price} <= {low}")
                 key = f"price_low:{symbol}:{low}"
-                show_alert(f"到价提醒：{symbol} 当前价 {price} <= 目标低 {low}", key)
+                msg = f"到价提醒 [{now_str}]：{symbol} ({name}) 当前价 {price} <= 目标低 {low}"
+                show_alert(msg, key)
     logger.info("到价提醒检查完成")
 
 
@@ -518,17 +557,19 @@ def check_volatility_alerts():
                 # 确定阈值：优先使用波动提醒独立配置，否则默认 9%
                 if symbol in VOLATILITY_ALERTS:
                     threshold = VOLATILITY_ALERTS[symbol]['threshold']
+                    name = VOLATILITY_ALERTS[symbol].get('name', '')
                 else:
                     threshold = 9.0  # 默认阈值
+                    name = PRICE_ALERTS.get(symbol, {}).get('name', '')
 
                 logger.debug(f"{symbol} 当前 {current}，上次 {previous}，变化 {change_pct:.2f}% (阈值 {threshold}%)")
                 if abs(change_pct) >= threshold:
                     direction = "上涨" if change_pct > 0 else "下跌"
                     logger.info(f"{symbol} 触发波动提醒: 变化 {abs(change_pct):.2f}% >= {threshold}%")
+                    now_str = datetime.now().strftime('%H:%M:%S')
                     key = f"volatility:{symbol}"
-                    show_alert(
-                        f"波动提醒：{symbol} 当前价 {current}，较上次 {previous} {direction} {abs(change_pct):.2f}%",
-                        key)
+                    msg = f"波动提醒 [{now_str}]：{symbol} ({name}) 当前价 {current}，较上次 {previous} {direction} {abs(change_pct):.2f}%"
+                    show_alert(msg, key)
             last_prices[symbol] = current
     logger.info("波动提醒检查完成")
 
@@ -541,14 +582,18 @@ def check_daily_losers():
         losers_hk = get_top_losers('HK')
         for sym, pct in losers_hk:
             logger.info(f"港股跌幅榜触发提醒: {sym} 跌幅 {pct}%")
+            now_str = datetime.now().strftime('%H:%M:%S')
             key = f"loser:HK:{sym}"
-            show_alert(f"港股跌幅榜提醒：{sym} 跌幅 {pct}% (超过90%)", key)
+            msg = f"港股跌幅榜提醒 [{now_str}]：{sym} 跌幅 {pct}% (超过90%)"
+            show_alert(msg, key)
     if is_us_trading_time(now):
         losers_us = get_top_losers('US')
         for sym, pct in losers_us:
             logger.info(f"美股跌幅榜触发提醒: {sym} 跌幅 {pct}%")
+            now_str = datetime.now().strftime('%H:%M:%S')
             key = f"loser:US:{sym}"
-            show_alert(f"美股跌幅榜提醒：{sym} 跌幅 {pct}% (超过90%)", key)
+            msg = f"美股跌幅榜提醒 [{now_str}]：{sym} 跌幅 {pct}% (超过90%)"
+            show_alert(msg, key)
     logger.info("跌幅榜提醒检查完成")
 
 
@@ -557,6 +602,7 @@ def is_trading_day(dt=None):
     if dt is None:
         dt = get_current_time()
     return dt.weekday() < 5
+
 
 def job():
     """定时任务：重新加载配置后执行检查"""
