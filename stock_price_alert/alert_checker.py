@@ -326,18 +326,29 @@ def is_us_trading_time(dt=None):
     return us_open <= dt <= us_close
 
 
+_last_window_geometry = None
+_geometry_lock = threading.Lock()
+
 # ==================== 弹窗提醒（支持合并和今日不再提醒）====================
+
 def _create_alert_window(alerts):
     """
-    根据给定的提醒列表创建新的弹窗。
-    alerts: list of (message, key)
+    根据给定的提醒列表创建新的弹窗，位置与上次相同。
     """
-    global _alert_window
+    global _alert_window, _last_window_geometry
     root = tk.Tk()
     root.withdraw()
     top = tk.Toplevel(root)
     top.title("股价提醒")
-    top.geometry("450x250")  # 增加高度确保按钮不被遮挡
+    top.geometry("450x250")  # 默认大小
+    # 如果之前有几何信息，则应用
+    with _geometry_lock:
+        if _last_window_geometry:
+            try:
+                top.geometry(_last_window_geometry)
+                logger.info(f"应用上次窗口几何: {_last_window_geometry}")
+            except:
+                pass
     top.attributes('-topmost', True)
     top.focus_force()
 
@@ -396,9 +407,9 @@ def _create_alert_window(alerts):
 
 def show_alert(message, key):
     """
-    显示提醒弹窗（合并版本）
+    显示提醒弹窗（合并版本），保留上次窗口位置。
     """
-    global _pending_alerts, _alert_window, _blocked_today, _blocked_date, _alert_lock
+    global _pending_alerts, _alert_window, _blocked_today, _blocked_date, _alert_lock, _last_window_geometry
 
     # 日期重置检查
     with _blocked_lock:
@@ -412,13 +423,16 @@ def show_alert(message, key):
             return
 
     with _alert_lock:
-        # 将新提醒加入待处理列表
         _pending_alerts.append((message, key))
         logger.info(f"待处理提醒数: {len(_pending_alerts)}")
 
         # 如果已有弹窗，先销毁（准备刷新）
         if _alert_window is not None:
             try:
+                # 在销毁前记录几何信息
+                with _geometry_lock:
+                    _last_window_geometry = _alert_window.geometry()
+                    logger.info(f"记录旧窗口几何: {_last_window_geometry}")
                 _alert_window.destroy()
             except:
                 pass
