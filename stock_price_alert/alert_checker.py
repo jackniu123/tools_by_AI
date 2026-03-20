@@ -9,6 +9,7 @@ import threading
 import json
 import os
 import logging
+import queue                     # 新增，用于跨线程消息传递
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 import schedule
@@ -53,6 +54,13 @@ _blocked_lock = threading.Lock()       # 保护屏蔽集合的线程锁
 _pending_alerts = []          # 存储尚未关闭的提醒 (message, key)
 _alert_window = None           # 当前弹窗窗口对象
 _alert_lock = threading.Lock() # 保护弹窗状态
+_alert_queue = None            # 队列，用于跨线程传递提醒消息
+_queue_ready = threading.Event()  # 队列就绪事件
+_queue_lock = threading.Lock()     # 保护队列相关操作
+
+# 窗口位置记忆
+_last_window_geometry = None
+_geometry_lock = threading.Lock()
 
 
 # ==================== 配置加载 ====================
@@ -326,16 +334,16 @@ def is_us_trading_time(dt=None):
     return us_open <= dt <= us_close
 
 
-_last_window_geometry = None
-_geometry_lock = threading.Lock()
-
 # ==================== 弹窗提醒（支持合并和今日不再提醒）====================
-
 def _create_alert_window(alerts):
     """
     根据给定的提醒列表创建新的弹窗，位置与上次相同。
+    内部维护一个队列，后续提醒会通过队列追加到该弹窗中。
     """
-    global _alert_window, _last_window_geometry
+    global _alert_window, _last_window_geometry, _alert_queue, _queue_ready
+    # 清除之前的队列就绪标志
+    _queue_ready.clear()
+
     root = tk.Tk()
     root.withdraw()
     top = tk.Toplevel(root)
@@ -366,34 +374,80 @@ def _create_alert_window(alerts):
     scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
     text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-    # 插入所有消息
-    for msg, _ in alerts:
-        text.insert(tk.END, msg + "\n\n")
-    text.configure(state=tk.DISABLED)
-
     # 按钮框架（置于底部，不扩展）
     btn_frame = tk.Frame(main_frame)
     btn_frame.pack(fill=tk.X, pady=(10, 0))
 
+    # 用于记录当前弹窗中所有提醒的 key
+    current_keys = []
+
+    # 插入初始消息（如果有）
+    for msg, key in alerts:
+        text.insert(tk.END, msg + "\n\n")
+        current_keys.append(key)
+    text.configure(state=tk.DISABLED)
+
+    # 队列和事件
+    _alert_queue = queue.Queue()
+    _queue_ready.set()   # 通知队列已就绪
+
+    def process_queue():
+        """定期从队列中取消息并追加到弹窗"""
+        nonlocal current_keys
+        try:
+            while True:
+                msg, key = _alert_queue.get_nowait()
+                # 如果该 key 已被屏蔽，跳过显示（但既然已通过屏蔽检查，理论上不会出现）
+                if key in _blocked_today:
+                    continue
+                text.configure(state=tk.NORMAL)
+                text.insert(tk.END, msg + "\n\n")
+                text.configure(state=tk.DISABLED)
+                current_keys.append(key)
+        except queue.Empty:
+            pass
+        # 继续定时检查
+        top.after(100, process_queue)
+
+    # 启动队列处理
+    top.after(100, process_queue)
+
     def on_close():
-        global _alert_window, _pending_alerts
+        global _alert_window, _alert_queue, _queue_ready
         with _alert_lock:
-            _pending_alerts.clear()
+            # 关闭窗口，清理全局变量
             _alert_window = None
+            if _alert_queue is not None:
+                # 清空队列
+                while not _alert_queue.empty():
+                    try:
+                        _alert_queue.get_nowait()
+                    except:
+                        break
+            _alert_queue = None
+            _queue_ready.clear()
         top.destroy()
         root.destroy()
 
     def on_snooze():
-        global _alert_window, _pending_alerts, _blocked_today
+        global _alert_window, _alert_queue, _queue_ready, _blocked_today
         with _alert_lock:
-            # 将所有提醒的key加入屏蔽集
-            for _, key in alerts:
-                _blocked_today.add(key)
-            _pending_alerts.clear()
+            # 将当前弹窗中所有提醒的 key 加入屏蔽集
+            for k in current_keys:
+                _blocked_today.add(k)
+            # 关闭窗口
             _alert_window = None
+            if _alert_queue is not None:
+                while not _alert_queue.empty():
+                    try:
+                        _alert_queue.get_nowait()
+                    except:
+                        break
+            _alert_queue = None
+            _queue_ready.clear()
         top.destroy()
         root.destroy()
-        logger.info(f"用户屏蔽今日提醒，共屏蔽 {len(alerts)} 条")
+        logger.info(f"用户屏蔽今日提醒，共屏蔽 {len(current_keys)} 条")
 
     btn_close = tk.Button(btn_frame, text="关闭", command=on_close, width=12)
     btn_close.pack(side=tk.LEFT, padx=5)
@@ -407,9 +461,9 @@ def _create_alert_window(alerts):
 
 def show_alert(message, key):
     """
-    显示提醒弹窗（合并版本），保留上次窗口位置。
+    显示提醒弹窗（合并版本），如果已有弹窗，则追加到现有弹窗中。
     """
-    global _pending_alerts, _alert_window, _blocked_today, _blocked_date, _alert_lock, _last_window_geometry
+    global _alert_window, _alert_queue, _queue_ready
 
     # 日期重置检查
     with _blocked_lock:
@@ -422,24 +476,25 @@ def show_alert(message, key):
             logger.info(f"提醒已被用户屏蔽今日不再弹: {key}")
             return
 
-    with _alert_lock:
-        _pending_alerts.append((message, key))
-        logger.info(f"待处理提醒数: {len(_pending_alerts)}")
+    # 如果弹窗已存在且队列就绪，直接将消息放入队列
+    if _alert_window is not None and _alert_queue is not None:
+        try:
+            _alert_queue.put((message, key))
+            logger.info(f"提醒已放入队列: {key}")
+            return
+        except Exception as e:
+            logger.error(f"放入队列失败: {e}")
 
-        # 如果已有弹窗，先销毁（准备刷新）
-        if _alert_window is not None:
-            try:
-                # 在销毁前记录几何信息
-                with _geometry_lock:
-                    _last_window_geometry = _alert_window.geometry()
-                    logger.info(f"记录旧窗口几何: {_last_window_geometry}")
-                _alert_window.destroy()
-            except:
-                pass
-            _alert_window = None
-
-    # 在新线程中创建弹窗（避免阻塞定时任务）
-    threading.Thread(target=_create_alert_window, args=(_pending_alerts.copy(),), daemon=True).start()
+    # 否则，创建新弹窗（在新线程中）
+    # 注意：创建弹窗的线程会设置 _alert_queue，我们在这里等待队列就绪
+    threading.Thread(target=_create_alert_window, args=([(message, key)],), daemon=True).start()
+    # 等待队列就绪，最多等待 3 秒（避免无限阻塞）
+    if not _queue_ready.wait(timeout=3):
+        logger.error("等待弹窗队列就绪超时")
+        return
+    # 队列就绪后，如果刚才创建弹窗的线程已将 _alert_queue 设置好，但消息已作为初始消息包含在内，
+    # 这里不需要再次放入，因为创建时已经将 (message, key) 作为初始提醒传入了。
+    logger.info("弹窗已创建，初始提醒已显示")
 
 
 # ==================== 提醒检查函数 ====================
