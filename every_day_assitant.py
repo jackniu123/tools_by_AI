@@ -8,6 +8,7 @@ import winreg  # 用于操作 Windows 注册表
 import stock_price_alert.alert_checker
 import proxy_finder.proxy_finder
 import new_stock_monitor.new_stock_monitor
+import buffet_holdings_change.holdings_change_notifier
 
 
 def add_to_startup():
@@ -77,6 +78,15 @@ def run_price_alert_checker():
         print(f"股价提醒检查器启动失败: {e}")
 
 
+def run_buffet_change_checker():
+    """在独立线程中运行buffet持仓变化监测"""
+    try:
+        buffet_holdings_change.holdings_change_notifier.main()
+    except Exception as e:
+        print(f"股价提醒检查器启动失败: {e}")
+
+
+
 if __name__ == '__main__':
     # 添加开机启动
     add_to_startup()
@@ -89,8 +99,9 @@ if __name__ == '__main__':
     t1 = threading.Thread(target=run_proxy_finder, daemon=True)
     t2 = threading.Thread(target=run_new_stock_monitor, daemon=True)
     t3 = threading.Thread(target=run_price_alert_checker, daemon=True)
+    t4 = threading.Thread(target=run_buffet_change_checker, daemon=True)
 
-    threads.extend([t1, t2, t3])
+    threads.extend([t1, t2, t3, t4])
 
     for t in threads:
         t.start()
