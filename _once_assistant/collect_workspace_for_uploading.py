@@ -12,16 +12,31 @@ import argparse
 
 # 默认包含的文件扩展名（可根据项目调整）
 DEFAULT_INCLUDE_EXTS = {
-    '.java', '.kt', '.xml', '.gradle', '.properties', '.txt',
-    '.md', '.cfg', '.conf', '.json', '.yaml', '.yml', '.kts',
-    '.html', '.pro'
+    # Android / Java / Kotlin
+    '.java', '.kt', '.kts', '.xml', '.gradle', '.properties',
+    # C / C++ / Objective-C / Swift
+    '.c', '.cpp', '.h', '.hpp', '.cc', '.cxx', '.m', '.mm', '.swift',
+    # Rust / Go / Zig
+    '.rs', '.go', '.zig',
+    # Web 前端
+    '.js', '.ts', '.jsx', '.tsx', '.vue', '.svelte', '.html', '.htm', '.xhtml', '.css', '.scss', '.sass', '.less', '.stylus',
+    # 脚本语言
+    '.py', '.rb', '.pl', '.pm', '.lua', '.php', '.sh', '.bash', '.zsh', '.fish', '.ps1', '.bat', '.cmd',
+    # 配置文件 / 数据
+    '.json', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf', '.env', '.editorconfig', '.gitignore', '.gitattributes',
+    # 构建与工具
+    '.cmake', '.makefile', '.dockerfile', '.groovy', '.scala', '.clj', '.cljs', '.edn',
+    # 文档 / 标记
+    '.md', '.txt', '.rst', '.tex', '.log', '.pro', '.properties',
+    # 数据库 / SQL
+    '.sql', '.psql',
 }
 
 # 默认排除的目录名（匹配任意路径段）
 DEFAULT_EXCLUDE_DIRS = {
     'build', '.gradle', '.idea', '.git', '.svn', 'out', 'bin', 'gen',
     'captures', '.settings', 'gradle', 'wrapper', '.cxx', 'release',
-    'test', 'androidTest'
+    'test', 'androidTest', 'node_modules'
 }
 
 # 默认排除的文件扩展名（二进制或编译产物）
