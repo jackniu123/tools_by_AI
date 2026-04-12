@@ -3,6 +3,7 @@
 Android 项目文件汇总工具（仅使用 .gitignore 规则）
 遍历 Android 项目目录，将文本文件的内容及路径输出到一个 TXT 文件中，
 完全遵循 .gitignore 规则来过滤文件。
+如果项目根目录下没有 .gitignore 文件，则尝试使用本脚本所在目录下的 .gitignore 作为全局规则。
 """
 
 import os
@@ -88,25 +89,35 @@ class GitIgnoreParser:
         return ''.join(regex)
 
     def is_ignored(self, rel_path):
-        """判断路径是否应该被忽略"""
-        # 统一使用正斜杠
         rel_path = rel_path.replace(os.sep, '/')
-
         for pattern in self.patterns:
             if pattern.search(rel_path):
+                print(f"[DEBUG] 匹配成功: {rel_path} 匹配规则 {pattern.pattern}")  # 加这行
                 return True
         return False
 
 
-def load_gitignore_rules(root_dir):
-    """加载项目中所有的 .gitignore 规则"""
+def load_gitignore_rules(root_dir, script_dir):
+    """
+    加载项目中所有的 .gitignore 规则。
+    如果项目根目录下没有 .gitignore，则尝试使用脚本所在目录下的 .gitignore 作为全局规则。
+    """
     rules = {}
+    # 1. 加载项目中的所有 .gitignore
     for gitignore_path in Path(root_dir).rglob('.gitignore'):
         # 跳过 .git 目录中的 .gitignore
         if '/.git/' in str(gitignore_path) or '\\.git\\' in str(gitignore_path):
             continue
         rules[str(gitignore_path.parent)] = GitIgnoreParser(gitignore_path)
         print(f"  加载规则: {gitignore_path}")
+
+    # 2. 如果根目录没有 .gitignore，尝试使用脚本目录下的 .gitignore 作为全局规则
+    if root_dir not in rules:
+        global_gitignore = os.path.join(script_dir, '.gitignore')
+        if os.path.exists(global_gitignore):
+            print(f"  项目根目录下无 .gitignore，使用全局规则: {global_gitignore}")
+            rules[root_dir] = GitIgnoreParser(global_gitignore)
+
     return rules
 
 
@@ -122,53 +133,33 @@ def is_text_file(file_path):
 
 def should_exclude(path, root, gitignore_rules):
     """根据 .gitignore 规则判断文件或目录是否应被排除"""
-    rel_path = os.path.relpath(path, root)
-
-    # 检查路径中是否包含 .git 目录
-    parts = rel_path.split(os.sep)
-    if '.git' in parts:
+    # 跳过 .git 目录
+    if '.git' in Path(path).parts:
         return True
 
-    # 检查每一级目录的 .gitignore 规则
-    # 从根目录开始检查，这样父目录的规则可以影响子目录
-    current_dir = root
-    remaining_path = rel_path
+    abs_path = os.path.abspath(path)
+    abs_root = os.path.abspath(root)
 
-    while current_dir != path and current_dir != os.path.dirname(path):
-        if current_dir in gitignore_rules:
-            # 计算相对于当前 .gitignore 的路径
-            rel_to_gitignore = os.path.relpath(path, current_dir)
-            if gitignore_rules[current_dir].is_ignored(rel_to_gitignore):
+    # 确定起始检查目录：如果是文件，从父目录开始；如果是目录，从自身开始
+    start_dir = os.path.dirname(abs_path) if os.path.isfile(abs_path) else abs_path
+
+    # 逐级向上检查，直到根目录
+    current = start_dir
+    while current >= abs_root:
+        if current in gitignore_rules:
+            rel = os.path.relpath(abs_path, current)
+            if gitignore_rules[current].is_ignored(rel):
                 return True
-
-        # 移动到下一级目录
-        if current_dir == root:
-            current_dir = os.path.join(current_dir, parts[0]) if parts else current_dir
-        else:
-            # 构建下一级路径
-            current_parts = os.path.relpath(current_dir, root).split(os.sep)
-            if len(current_parts) < len(parts) and current_parts != ['.']:
-                next_part = parts[len(current_parts)]
-                current_dir = os.path.join(current_dir, next_part)
-            else:
-                break
-
-    # 最后检查文件/目录所在目录的 .gitignore
-    parent_dir = os.path.dirname(path)
-    while parent_dir != root and parent_dir != os.path.dirname(root):
-        if parent_dir in gitignore_rules:
-            rel_to_gitignore = os.path.relpath(path, parent_dir)
-            if gitignore_rules[parent_dir].is_ignored(rel_to_gitignore):
-                return True
-        parent_dir = os.path.dirname(parent_dir)
-
+        if current == abs_root:
+            break
+        current = os.path.dirname(current)
     return False
 
 
-def collect_files(root_dir):
+def collect_files(root_dir, script_dir):
     """收集文件，遵循 .gitignore 规则"""
     print("正在加载 .gitignore 规则...")
-    gitignore_rules = load_gitignore_rules(root_dir)
+    gitignore_rules = load_gitignore_rules(root_dir, script_dir)
 
     included = []
     excluded = []
@@ -292,7 +283,9 @@ def main():
 
     print(f"扫描目录: {args.project_dir}")
 
-    included, excluded = collect_files(args.project_dir)
+    # 获取脚本所在目录
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    included, excluded = collect_files(args.project_dir, script_dir)
 
     root_name = os.path.basename(args.project_dir.rstrip('/\\')) or args.project_dir
 
