@@ -463,7 +463,7 @@ def show_alert(message, key):
     """
     显示提醒弹窗（合并版本），如果已有弹窗，则追加到现有弹窗中。
     """
-    global _alert_window, _alert_queue, _queue_ready
+    global _alert_window, _alert_queue, _queue_ready, _blocked_date, _blocked_today
 
     # 日期重置检查
     with _blocked_lock:
