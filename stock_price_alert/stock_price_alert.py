@@ -10,6 +10,7 @@ import threading
 import json
 import os
 import logging
+import queue
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 import tkinter as tk
@@ -90,7 +91,6 @@ def get_stock_name(symbol):
             df = get_market_data(market)
             if df is None:
                 return ""
-            # 港股名称列可能是 '名称' 或 'name'
             name_col = '名称' if '名称' in df.columns else 'name'
             row = df[df['代码'] == code]
             if not row.empty:
@@ -101,10 +101,8 @@ def get_stock_name(symbol):
             df = get_market_data(market)
             if df is None:
                 return ""
-            # 美股名称列可能是 '名称' 或 'name'
             if '名称' in df.columns:
                 name_col = '名称'
-                # 美股通常有 'symbol' 列
                 row = df[df['symbol'] == code] if 'symbol' in df.columns else None
             else:
                 name_col = 'name'
@@ -112,13 +110,11 @@ def get_stock_name(symbol):
             if row is not None and not row.empty:
                 return str(row[name_col].iloc[0])
         else:
-            # A股
             market = 'A'
             code = symbol
             df = get_market_data(market)
             if df is None:
                 return ""
-            # A股名称列可能是 '名称' 或 'name'
             name_col = '名称' if '名称' in df.columns else 'name'
             row = df[df['代码'] == code]
             if not row.empty:
@@ -135,7 +131,6 @@ def load_config():
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            # 到价提醒
             price_list = data.get('price_alerts', [])
             PRICE_ALERTS = {}
             for item in price_list:
@@ -151,7 +146,6 @@ def load_config():
                     thresholds['low'] = float(item['low'])
                 if thresholds:
                     PRICE_ALERTS[symbol] = {'name': name, **thresholds}
-            # 波动提醒
             vol_list = data.get('volatility_alerts', [])
             VOLATILITY_ALERTS = {}
             for item in vol_list:
@@ -207,7 +201,7 @@ class AlertSettingsApp:
     def __init__(self, root):
         self.root = root
         self.root.title("股价提醒设置")
-        self.root.geometry("900x550")  # 适当加宽
+        self.root.geometry("900x550")
 
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill='both', expand=True, padx=5, pady=5)
@@ -232,8 +226,85 @@ class AlertSettingsApp:
         load_config()
         self.refresh_displays()
 
+        # ========== 新增：提醒消息队列及回调设置 ==========
+        self.alert_queue = queue.Queue()
+        # 设置 alert_checker 的回调函数
+        alert_checker.set_alert_callback(self.on_alert_callback)
+        # 启动主线程定期处理队列
+        self.root.after(200, self.process_alert_queue)
+
         # 启动后台检查器
         alert_checker.start_checker()
+
+    # ========== 新增：处理来自后台线程的提醒 ==========
+    def on_alert_callback(self, message, key):
+        """由 alert_checker 后台线程调用，将消息放入队列"""
+        try:
+            self.alert_queue.put((message, key))
+            logger.debug(f"提醒已放入UI队列: {key}")
+        except Exception as e:
+            logger.error(f"放入UI队列失败: {e}")
+
+    def process_alert_queue(self):
+        """在主线程中定期处理队列中的提醒消息，创建弹窗"""
+        try:
+            while True:
+                msg, key = self.alert_queue.get_nowait()
+                self._show_alert_window(msg, key)
+        except queue.Empty:
+            pass
+        self.root.after(500, self.process_alert_queue)  # 每500ms检查一次
+
+    def _show_alert_window(self, message, key):
+        """在主线程中创建弹窗（使用 Toplevel，不新建 Tk 实例）"""
+        # 简单去重：如果已经存在相同 key 的弹窗（通过检查窗口标题或 key 存储），可以合并，这里简化处理
+        # 为了支持“今日不再提醒”，我们在弹窗中提供按钮
+        top = tk.Toplevel(self.root)
+        top.title("股价提醒")
+        top.geometry("450x250")
+        top.attributes('-topmost', True)
+
+        # 文本框
+        text = tk.Text(top, wrap=tk.WORD, font=("微软雅黑", 10))
+        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        text.insert(tk.END, message)
+        text.configure(state=tk.DISABLED)
+
+        # 按钮框架
+        btn_frame = tk.Frame(top)
+        btn_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        # 关闭按钮
+        def on_close():
+            top.destroy()
+        tk.Button(btn_frame, text="关闭", command=on_close, width=12).pack(side=tk.LEFT, padx=5)
+
+        # 今日不再提醒按钮（将 key 加入屏蔽集，由 UI 维护）
+        # 注意：需要和 alert_checker 中的屏蔽逻辑协调。为了简单，我们完全在 UI 侧维护屏蔽集。
+        # 但 alert_checker 不会再推送已屏蔽的提醒，因为提醒是由 alert_checker 产生的，它不知道 UI 屏蔽。
+        # 解决方案：让 alert_checker 在推送前也检查 UI 的屏蔽集？但跨线程复杂。我们可以在 UI 收到消息时检查屏蔽集。
+        # 简便做法：在 UI 中维护一个 _blocked_today 集合，在显示前检查。
+        if not hasattr(self, '_blocked_today'):
+            self._blocked_today = set()
+            self._blocked_date = datetime.now().date()
+        # 日期重置
+        today = datetime.now().date()
+        if today != self._blocked_date:
+            self._blocked_today.clear()
+            self._blocked_date = today
+        # 如果 key 已在今日屏蔽集中，则不显示弹窗
+        if key in self._blocked_today:
+            top.destroy()
+            return
+
+        def on_snooze():
+            self._blocked_today.add(key)
+            top.destroy()
+            logger.info(f"用户屏蔽今日提醒: {key}")
+        tk.Button(btn_frame, text="今日不再提醒", command=on_snooze, width=15).pack(side=tk.LEFT, padx=5)
+
+        # 窗口关闭时不做额外操作
+        top.protocol("WM_DELETE_WINDOW", on_close)
 
     # ---------- 到价提醒选项卡 ----------
     def create_price_tab(self):
@@ -318,7 +389,6 @@ class AlertSettingsApp:
 
     # ---------- 波动提醒选项卡 ----------
     def create_vol_tab(self):
-        # 说明标签
         info_label = ttk.Label(self.vol_frame, text="波动提醒默认监控到价提醒中的所有股票（阈值9%），您也可在此独立添加其他股票并自定义阈值。", foreground='blue')
         info_label.pack(pady=5)
 
@@ -405,7 +475,6 @@ class AlertSettingsApp:
     # ---------- 通用 ----------
     def refresh_displays(self):
         """刷新两个列表显示"""
-        # 刷新到价提醒
         for row in self.price_tree.get_children():
             self.price_tree.delete(row)
         for symbol, info in PRICE_ALERTS.items():
@@ -414,7 +483,6 @@ class AlertSettingsApp:
             low = info.get('low', '')
             self.price_tree.insert('', 'end', values=(symbol, name, high, low))
 
-        # 刷新波动提醒
         for row in self.vol_tree.get_children():
             self.vol_tree.delete(row)
         for symbol, info in VOLATILITY_ALERTS.items():
@@ -564,6 +632,8 @@ def main():
     app = AlertSettingsApp(root)
     logger.info("UI界面启动，后台检查器已运行")
     root.mainloop()
+    # 程序退出时停止检查器
+    alert_checker.stop_checker()
 
 if __name__ == "__main__":
     main()

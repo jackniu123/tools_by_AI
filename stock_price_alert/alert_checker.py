@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-股价提醒检查模块，独立于UI运行。
-提供 start_checker() 函数启动后台定时检查（每5分钟）。
+股价提醒检查模块（无 UI 线程版）
+独立于 UI 运行，通过回调函数将提醒消息传递给 UI 线程。
+提供 start_checker() 启动后台定时检查（每5分钟）。
 配置文件路径：C:/Users/Administrator/stock_price_alert/alerts_config.json
 """
 import time
@@ -9,14 +10,11 @@ import threading
 import json
 import os
 import logging
-import queue                     # 新增，用于跨线程消息传递
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 import schedule
 import akshare as ak
 import pandas as pd
-import tkinter as tk
-from tkinter import messagebox
 
 # ==================== 日志配置 ====================
 LOG_DIR = r"C:\Users\Administrator\stock_price_alert"
@@ -40,28 +38,39 @@ logger.addHandler(console_handler)
 # ==================== 全局变量 ====================
 CONFIG_DIR = r"C:\Users\Administrator\stock_price_alert"
 CONFIG_FILE = os.path.join(CONFIG_DIR, "alerts_config.json")
-PRICE_ALERTS = {}  # 格式: {symbol: {"name": str, "high": float, "low": float}}
-VOLATILITY_ALERTS = {}  # 格式: {symbol: {"name": str, "threshold": float}}
-last_prices = {}  # 存储上一次价格，用于波动计算
-_market_cache = {}  # 市场数据缓存
+PRICE_ALERTS = {}          # {symbol: {"name": str, "high": float, "low": float}}
+VOLATILITY_ALERTS = {}     # {symbol: {"name": str, "threshold": float}}
+last_prices = {}           # 存储上一次价格，用于波动计算
+_market_cache = {}         # 市场数据缓存
 
-# 今日屏蔽记录
-_blocked_today = set()          # 存储当天已屏蔽的提醒键
-_blocked_date = datetime.now().date()  # 记录当前日期，用于每天重置
-_blocked_lock = threading.Lock()       # 保护屏蔽集合的线程锁
+# 今日屏蔽记录（仅用于检查器内部去重，实际屏蔽由 UI 维护，这里保留用于内部防重复推送）
+_blocked_today = set()
+_blocked_date = datetime.now().date()
+_blocked_lock = threading.Lock()
 
-# 弹窗合并相关
-_pending_alerts = []          # 存储尚未关闭的提醒 (message, key)
-_alert_window = None           # 当前弹窗窗口对象
-_alert_lock = threading.Lock() # 保护弹窗状态
-_alert_queue = None            # 队列，用于跨线程传递提醒消息
-_queue_ready = threading.Event()  # 队列就绪事件
-_queue_lock = threading.Lock()     # 保护队列相关操作
+# 回调函数（由 UI 设置，用于传递提醒消息）
+_alert_callback = None
+_callback_lock = threading.Lock()
 
-# 窗口位置记忆
-_last_window_geometry = None
-_geometry_lock = threading.Lock()
+# ==================== 回调设置 ====================
+def set_alert_callback(callback):
+    """设置提醒回调函数，参数为 (message, key)"""
+    global _alert_callback
+    with _callback_lock:
+        _alert_callback = callback
+        logger.info("提醒回调函数已设置")
 
+def _send_alert(message, key):
+    """内部发送提醒，通过回调函数传递给 UI 线程"""
+    with _callback_lock:
+        if _alert_callback:
+            try:
+                _alert_callback(message, key)
+                logger.debug(f"提醒已通过回调发送: {key}")
+            except Exception as e:
+                logger.error(f"调用提醒回调失败: {e}")
+        else:
+            logger.warning("提醒回调未设置，忽略提醒: " + message)
 
 # ==================== 配置加载 ====================
 def load_config():
@@ -111,7 +120,6 @@ def load_config():
         VOLATILITY_ALERTS = {}
         logger.info("配置文件不存在，使用空配置")
 
-
 def save_config():
     """保存配置到JSON文件（供UI调用，检查器中也可保留）"""
     price_list = []
@@ -142,7 +150,6 @@ def save_config():
         logger.info(f"配置已保存到 {CONFIG_FILE}")
     except Exception as e:
         logger.error(f"保存配置文件失败: {e}")
-
 
 # ==================== 数据获取与缓存 ====================
 def get_market_data(market):
@@ -178,7 +185,6 @@ def get_market_data(market):
             return _market_cache[market]['data']
         return None
 
-
 def get_stock_price(symbol):
     """
     从缓存的市场数据中提取股票实时价格
@@ -208,7 +214,6 @@ def get_stock_price(symbol):
             df = get_market_data(market)
             if df is None:
                 return None
-            # 尝试不同列名
             if 'symbol' in df.columns:
                 row = df[df['symbol'] == code]
             elif '代码' in df.columns:
@@ -236,6 +241,7 @@ def get_stock_price(symbol):
             df = get_market_data(market)
             if df is None:
                 return None
+            # A股代码列可能是 '代码' 且带有前缀，如 'sh600519'，直接包含后6位
             row = df[df['代码'].str[2:] == code]
             if not row.empty:
                 price = float(row['最新价'].iloc[0])
@@ -247,7 +253,6 @@ def get_stock_price(symbol):
     except Exception as e:
         logger.error(f"提取 {symbol} 价格失败: {e}")
         return None
-
 
 def get_top_losers(market):
     """从缓存的市场数据中获取跌幅超过90%的股票列表"""
@@ -277,11 +282,9 @@ def get_top_losers(market):
         logger.error(f"获取 {market} 跌幅榜失败: {e}")
     return losers
 
-
 # ==================== 交易时间判断 ====================
 def get_current_time():
     return datetime.now()
-
 
 def is_a_trading_time(dt=None):
     """判断给定时间（北京时间）是否在A股交易时间内。A股交易时间：上午 9:30-11:30，下午 13:00-15:00"""
@@ -295,7 +298,6 @@ def is_a_trading_time(dt=None):
     afternoon_end = dt.replace(hour=15, minute=0, second=0, microsecond=0)
     return (morning_start <= dt <= morning_end) or (afternoon_start <= dt <= afternoon_end)
 
-
 def is_hk_trading_time(dt=None):
     """判断给定时间（北京时间）是否在港股交易时间内"""
     if dt is None:
@@ -307,7 +309,6 @@ def is_hk_trading_time(dt=None):
     afternoon_start = dt.replace(hour=13, minute=0, second=0, microsecond=0)
     afternoon_end = dt.replace(hour=16, minute=0, second=0, microsecond=0)
     return (morning_start <= dt <= morning_end) or (afternoon_start <= dt <= afternoon_end)
-
 
 def is_us_trading_time(dt=None):
     """判断给定时间（北京时间）是否在美股交易时间内（简化的夏令时判断）"""
@@ -332,170 +333,6 @@ def is_us_trading_time(dt=None):
         us_close = (dt + timedelta(days=1)).replace(hour=5, minute=0, second=0, microsecond=0)
 
     return us_open <= dt <= us_close
-
-
-# ==================== 弹窗提醒（支持合并和今日不再提醒）====================
-def _create_alert_window(alerts):
-    """
-    根据给定的提醒列表创建新的弹窗，位置与上次相同。
-    内部维护一个队列，后续提醒会通过队列追加到该弹窗中。
-    """
-    global _alert_window, _last_window_geometry, _alert_queue, _queue_ready
-    # 清除之前的队列就绪标志
-    _queue_ready.clear()
-
-    root = tk.Tk()
-    root.withdraw()
-    top = tk.Toplevel(root)
-    top.title("股价提醒")
-    top.geometry("450x250")  # 默认大小
-    # 如果之前有几何信息，则应用
-    with _geometry_lock:
-        if _last_window_geometry:
-            try:
-                top.geometry(_last_window_geometry)
-                logger.info(f"应用上次窗口几何: {_last_window_geometry}")
-            except:
-                pass
-    top.attributes('-topmost', True)
-    top.focus_force()
-
-    # 主框架，使用pack布局
-    main_frame = tk.Frame(top)
-    main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-    # 文本框框架（占用大部分空间）
-    text_frame = tk.Frame(main_frame)
-    text_frame.pack(fill=tk.BOTH, expand=True)
-
-    text = tk.Text(text_frame, wrap=tk.WORD, height=8, font=("微软雅黑", 10))
-    scrollbar = tk.Scrollbar(text_frame, command=text.yview)
-    text.configure(yscrollcommand=scrollbar.set)
-    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-    text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-    # 按钮框架（置于底部，不扩展）
-    btn_frame = tk.Frame(main_frame)
-    btn_frame.pack(fill=tk.X, pady=(10, 0))
-
-    # 用于记录当前弹窗中所有提醒的 key
-    current_keys = []
-
-    # 插入初始消息（如果有）
-    for msg, key in alerts:
-        text.insert(tk.END, msg + "\n\n")
-        current_keys.append(key)
-    text.configure(state=tk.DISABLED)
-
-    # 队列和事件
-    _alert_queue = queue.Queue()
-    _queue_ready.set()   # 通知队列已就绪
-
-    def process_queue():
-        """定期从队列中取消息并追加到弹窗"""
-        nonlocal current_keys
-        try:
-            while True:
-                msg, key = _alert_queue.get_nowait()
-                # 如果该 key 已被屏蔽，跳过显示（但既然已通过屏蔽检查，理论上不会出现）
-                if key in _blocked_today:
-                    continue
-                text.configure(state=tk.NORMAL)
-                text.insert(tk.END, msg + "\n\n")
-                text.configure(state=tk.DISABLED)
-                current_keys.append(key)
-        except queue.Empty:
-            pass
-        # 继续定时检查
-        top.after(100, process_queue)
-
-    # 启动队列处理
-    top.after(100, process_queue)
-
-    def on_close():
-        global _alert_window, _alert_queue, _queue_ready
-        with _alert_lock:
-            # 关闭窗口，清理全局变量
-            _alert_window = None
-            if _alert_queue is not None:
-                # 清空队列
-                while not _alert_queue.empty():
-                    try:
-                        _alert_queue.get_nowait()
-                    except:
-                        break
-            _alert_queue = None
-            _queue_ready.clear()
-        top.destroy()
-        root.destroy()
-
-    def on_snooze():
-        global _alert_window, _alert_queue, _queue_ready, _blocked_today
-        with _alert_lock:
-            # 将当前弹窗中所有提醒的 key 加入屏蔽集
-            for k in current_keys:
-                _blocked_today.add(k)
-            # 关闭窗口
-            _alert_window = None
-            if _alert_queue is not None:
-                while not _alert_queue.empty():
-                    try:
-                        _alert_queue.get_nowait()
-                    except:
-                        break
-            _alert_queue = None
-            _queue_ready.clear()
-        top.destroy()
-        root.destroy()
-        logger.info(f"用户屏蔽今日提醒，共屏蔽 {len(current_keys)} 条")
-
-    btn_close = tk.Button(btn_frame, text="关闭", command=on_close, width=12)
-    btn_close.pack(side=tk.LEFT, padx=5)
-    btn_snooze = tk.Button(btn_frame, text="今日不再提醒", command=on_snooze, width=15)
-    btn_snooze.pack(side=tk.LEFT, padx=5)
-
-    top.protocol("WM_DELETE_WINDOW", on_close)
-    _alert_window = top
-    root.mainloop()
-
-
-def show_alert(message, key):
-    """
-    显示提醒弹窗（合并版本），如果已有弹窗，则追加到现有弹窗中。
-    """
-    global _alert_window, _alert_queue, _queue_ready, _blocked_date, _blocked_today
-
-    # 日期重置检查
-    with _blocked_lock:
-        today = datetime.now().date()
-        if today != _blocked_date:
-            _blocked_today.clear()
-            _blocked_date = today
-            logger.info("日期变化，清空今日屏蔽记录")
-        if key in _blocked_today:
-            logger.info(f"提醒已被用户屏蔽今日不再弹: {key}")
-            return
-
-    # 如果弹窗已存在且队列就绪，直接将消息放入队列
-    if _alert_window is not None and _alert_queue is not None:
-        try:
-            _alert_queue.put((message, key))
-            logger.info(f"提醒已放入队列: {key}")
-            return
-        except Exception as e:
-            logger.error(f"放入队列失败: {e}")
-
-    # 否则，创建新弹窗（在新线程中）
-    # 注意：创建弹窗的线程会设置 _alert_queue，我们在这里等待队列就绪
-    threading.Thread(target=_create_alert_window, args=([(message, key)],), daemon=True).start()
-    # 等待队列就绪，最多等待 3 秒（避免无限阻塞）
-    if not _queue_ready.wait(timeout=3):
-        logger.error("等待弹窗队列就绪超时")
-        return
-    # 队列就绪后，如果刚才创建弹窗的线程已将 _alert_queue 设置好，但消息已作为初始消息包含在内，
-    # 这里不需要再次放入，因为创建时已经将 (message, key) 作为初始提醒传入了。
-    logger.info("弹窗已创建，初始提醒已显示")
-
 
 # ==================== 提醒检查函数 ====================
 def check_price_alerts():
@@ -539,7 +376,6 @@ def check_price_alerts():
             logger.warning(f"获取{market}市场数据失败，跳过该市场股票检查")
             continue
 
-        # 对该市场中的每只股票进行检查
         for symbol in symbols:
             price = get_stock_price(symbol)
             if price is None:
@@ -550,7 +386,6 @@ def check_price_alerts():
             thresholds = alerts[symbol]
             name = thresholds.get('name', '')
 
-            # --- 打印股票名称、当前价格和目标价格到控制台（通过logger.info） ---
             high = thresholds.get('high')
             low = thresholds.get('low')
             log_msg = f"股票 {symbol} ({name}) 当前价格: {price}"
@@ -565,14 +400,13 @@ def check_price_alerts():
                 logger.info(f"{symbol} 触发高阈值提醒: {price} >= {high}")
                 key = f"price_high:{symbol}:{high}"
                 msg = f"到价提醒 [{now_str}]：{symbol} ({name}) 当前价 {price} >= 目标高 {high}"
-                show_alert(msg, key)
+                _send_alert(msg, key)
             if low is not None and price <= low:
                 logger.info(f"{symbol} 触发低阈值提醒: {price} <= {low}")
                 key = f"price_low:{symbol}:{low}"
                 msg = f"到价提醒 [{now_str}]：{symbol} ({name}) 当前价 {price} <= 目标低 {low}"
-                show_alert(msg, key)
+                _send_alert(msg, key)
     logger.info("到价提醒检查完成")
-
 
 def check_volatility_alerts():
     """
@@ -581,14 +415,12 @@ def check_volatility_alerts():
     波动阈值优先使用波动提醒中的设置，若不存在则使用默认 9%
     """
     global last_prices
-    # 合并股票列表（去重）
     all_symbols = set(PRICE_ALERTS.keys()) | set(VOLATILITY_ALERTS.keys())
     if not all_symbols:
         logger.debug("波动提醒监控列表为空，跳过")
         return
     logger.info(f"开始检查波动提醒，监控 {len(all_symbols)} 只股票")
 
-    # 按市场分组
     market_groups = {'A': [], 'HK': [], 'US': []}
     for symbol in all_symbols:
         if symbol.endswith('.HK'):
@@ -603,7 +435,6 @@ def check_volatility_alerts():
         if not symbols:
             continue
 
-        # 交易时间判断
         if market == 'A' and not is_a_trading_time(now):
             logger.info(f"A股非交易时间，跳过该市场 {len(symbols)} 只股票的波动检查")
             continue
@@ -628,12 +459,11 @@ def check_volatility_alerts():
             if previous is not None:
                 change_pct = (current - previous) / previous * 100
 
-                # 确定阈值：优先使用波动提醒独立配置，否则默认 9%
                 if symbol in VOLATILITY_ALERTS:
                     threshold = VOLATILITY_ALERTS[symbol]['threshold']
                     name = VOLATILITY_ALERTS[symbol].get('name', '')
                 else:
-                    threshold = 9.0  # 默认阈值
+                    threshold = 9.0
                     name = PRICE_ALERTS.get(symbol, {}).get('name', '')
 
                 logger.debug(f"{symbol} 当前 {current}，上次 {previous}，变化 {change_pct:.2f}% (阈值 {threshold}%)")
@@ -643,13 +473,12 @@ def check_volatility_alerts():
                     now_str = datetime.now().strftime('%H:%M:%S')
                     key = f"volatility:{symbol}"
                     msg = f"波动提醒 [{now_str}]：{symbol} ({name}) 当前价 {current}，较上次 {previous} {direction} {abs(change_pct):.2f}%"
-                    show_alert(msg, key)
+                    _send_alert(msg, key)
             last_prices[symbol] = current
     logger.info("波动提醒检查完成")
 
-
 def check_daily_losers():
-    """检查跌幅榜提醒"""
+    """检查跌幅榜提醒（仅监控跌幅超过90%的股票）"""
     now = get_current_time()
     logger.info("开始检查跌幅榜提醒")
     if is_hk_trading_time(now):
@@ -659,7 +488,7 @@ def check_daily_losers():
             now_str = datetime.now().strftime('%H:%M:%S')
             key = f"loser:HK:{sym}"
             msg = f"港股跌幅榜提醒 [{now_str}]：{sym} 跌幅 {pct}% (超过90%)"
-            show_alert(msg, key)
+            _send_alert(msg, key)
     if is_us_trading_time(now):
         losers_us = get_top_losers('US')
         for sym, pct in losers_us:
@@ -667,9 +496,8 @@ def check_daily_losers():
             now_str = datetime.now().strftime('%H:%M:%S')
             key = f"loser:US:{sym}"
             msg = f"美股跌幅榜提醒 [{now_str}]：{sym} 跌幅 {pct}% (超过90%)"
-            show_alert(msg, key)
+            _send_alert(msg, key)
     logger.info("跌幅榜提醒检查完成")
-
 
 def is_trading_day(dt=None):
     """判断给定时间（北京时间）是否为交易日（仅跳过周末）"""
@@ -677,24 +505,21 @@ def is_trading_day(dt=None):
         dt = get_current_time()
     return dt.weekday() < 5
 
-
 def job():
     """定时任务：重新加载配置后执行检查"""
     if not is_trading_day():
         logger.info("今天是非交易日，跳过所有检查")
         return
     logger.info("========== 开始执行定时任务 ==========")
-    load_config()  # 每次运行前重新加载配置，确保最新设置
+    load_config()  # 每次运行前重新加载配置
     check_price_alerts()
     check_volatility_alerts()
     check_daily_losers()
     logger.info("========== 定时任务执行完成 ==========")
 
-
 # ==================== 启动控制 ====================
 _checker_thread = None
 _stop_event = threading.Event()
-
 
 def _run_schedule():
     """在单独线程中运行 schedule 循环"""
@@ -705,7 +530,6 @@ def _run_schedule():
         schedule.run_pending()
         time.sleep(1)
     logger.info("检查器线程停止")
-
 
 def start_checker():
     """启动后台提醒检查线程（如果未启动）"""
@@ -718,7 +542,6 @@ def start_checker():
     _checker_thread.start()
     logger.info("后台检查器已启动")
 
-
 def stop_checker():
     """停止后台提醒检查线程"""
     global _stop_event
@@ -726,8 +549,7 @@ def stop_checker():
     logger.info("发送停止信号，等待检查器线程结束...")
     # 线程会在下一次 sleep 后退出
 
-
-# 如果直接运行此模块，启动检查器（便于独立测试）
+# 如果直接运行此模块，仅启动检查器（无 UI，仅用于测试）
 if __name__ == "__main__":
     start_checker()
     try:
