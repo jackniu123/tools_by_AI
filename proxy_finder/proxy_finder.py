@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-海外免费代理自动搜索与验证脚本（增强版，带缓存与重试）
+海外免费代理自动搜索与验证脚本（完整整合增强版）
 功能：从多个免费代理源抓取IP -> 验证对 protonvpn.com 的可用性 -> 测试速度 -> 筛选海外节点
-修正：✅ 增加内置备用代理、本地缓存、重试机制、镜像源
+改进：引导代理、协议识别、内容验证、失败源缓存、递归抓取
 适用：Windows/Linux/Mac 需要Python3.6+
 """
 
@@ -13,7 +13,7 @@ import threading
 import time
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import os
 import random
@@ -21,11 +21,14 @@ import urllib3
 
 # ==================== 配置区域 ====================
 TEST_URL = "https://protonvpn.com"           # 目标网站
-TIMEOUT = 10                                  # 代理测试超时时间（秒）
+TIMEOUT_CONNECT = 5                           # 连接超时（秒）
+TIMEOUT_READ = 10                             # 读取超时（秒）
 MAX_WORKERS = 300                             # 并发验证线程数
 MIN_SPEED = 8000                              # 最小接受速度（毫秒），8秒
 MAX_PROXIES_TO_TEST = 5000                    # 每次最多测试的代理数量（随机采样）
-TEST_METHOD = 'head'                           # 'head' 或 'get'
+TEST_METHOD = 'get'                           # 始终使用 GET（HEAD 太容易被屏蔽）
+VERIFY_CONTENT = True                         # 是否验证响应内容包含目标关键词
+TARGET_KEYWORD = "Proton VPN"                 # 目标网站特征文本
 
 # 输出目录：用户主目录下的 proxy_finder_results
 USER_DIR = os.path.expanduser("~")
@@ -33,6 +36,7 @@ OUTPUT_DIR = os.path.join(USER_DIR, "proxy_finder_results")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "protonvpn_proxies.txt")
 CACHE_FILE = os.path.join(OUTPUT_DIR, "last_valid_proxies.json")
+DEAD_SOURCES_FILE = os.path.join(OUTPUT_DIR, "dead_sources.json")  # 记录失败源
 
 # ==================== 代理源列表 ====================
 PROXY_SOURCES = [
@@ -102,7 +106,14 @@ PROXY_SOURCES = [
         'type': 'plain',
         'timeout': 30
     },
-    # 内置备用代理（请定期更新）
+    # 引导代理源（首先尝试用这些工作代理去抓取其他源，但此处作为普通备用源）
+    {
+        'name': 'Bootstrap_Proxy',
+        'url': 'https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt',
+        'type': 'plain',
+        'timeout': 15
+    },
+    # 内置备用代理（保底，请定期手动更新）
     {
         'name': 'Builtin_Backup',
         'type': 'builtin',
@@ -114,28 +125,36 @@ PROXY_SOURCES = [
     }
 ]
 
-# 需要排除的国内IP段（粗略匹配）
-CN_IP_RANGES = [
-    '1.', '2.', '3.', '4.', '5.', '6.', '7.', '8.', '9.', '10.',
-    '11.', '12.', '13.', '14.', '15.', '16.', '17.', '18.', '19.', '20.',
-    '21.', '22.', '23.', '24.', '25.', '26.', '27.', '28.', '29.', '30.',
-    '31.', '32.', '33.', '34.', '35.', '36.', '37.', '38.', '39.', '40.',
-    '41.', '42.', '43.', '44.', '45.', '46.', '47.', '48.', '49.', '50.',
-    '58.', '59.', '60.', '61.', '110.', '111.', '112.', '113.', '114.',
-    '115.', '116.', '117.', '118.', '119.', '120.', '121.', '122.', '123.',
-    '124.', '125.', '126.', '127.', '128.', '129.', '130.', '131.', '132.',
-    '133.', '134.', '135.', '136.', '137.', '138.', '139.', '140.', '141.',
-    '142.', '143.', '144.', '145.', '146.', '147.', '148.', '149.', '150.',
-    '151.', '152.', '153.', '154.', '155.', '156.', '157.', '158.', '159.',
-    '160.', '161.', '162.', '163.', '164.', '165.', '166.', '167.', '168.',
-    '169.', '170.', '171.', '172.', '173.', '174.', '175.', '176.', '177.',
-    '178.', '179.', '180.', '181.', '182.', '183.', '184.', '185.', '186.',
-    '187.', '188.', '189.', '190.', '191.', '192.', '193.', '194.', '195.',
-    '196.', '197.', '198.', '199.', '200.', '201.', '202.', '203.', '204.',
-    '205.', '206.', '207.', '208.', '209.', '210.', '211.', '212.', '213.',
-    '214.', '215.', '216.', '217.', '218.', '219.', '220.', '221.', '222.',
-    '223.'
-]
+# ==================== 失败源缓存管理 ====================
+def load_dead_sources():
+    if os.path.exists(DEAD_SOURCES_FILE):
+        try:
+            with open(DEAD_SOURCES_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+def save_dead_sources(dead):
+    with open(DEAD_SOURCES_FILE, 'w') as f:
+        json.dump(dead, f, indent=2)
+
+def is_source_dead(name):
+    dead = load_dead_sources()
+    if name in dead:
+        until = dead[name].get('until')
+        if until and datetime.now() < datetime.fromisoformat(until):
+            return True
+        else:
+            # 过期则删除记录
+            del dead[name]
+            save_dead_sources(dead)
+    return False
+
+def mark_source_dead(name, hours=24):
+    dead = load_dead_sources()
+    dead[name] = {'until': (datetime.now() + timedelta(hours=hours)).isoformat()}
+    save_dead_sources(dead)
 
 # ==================== 缓存函数 ====================
 def load_cache():
@@ -151,13 +170,41 @@ def save_cache(proxies):
     with open(CACHE_FILE, 'w', encoding='utf-8') as f:
         json.dump(proxies, f, indent=2)
 
-# ==================== 核心函数 ====================
+# ==================== 代理格式规范化与协议识别 ====================
+def normalize_proxy(proxy_str):
+    """
+    将原始代理字符串统一为带协议的格式：http://ip:port 或 socks5://ip:port
+    若无法识别，默认 http
+    """
+    proxy_str = proxy_str.strip()
+    if proxy_str.startswith(('http://', 'https://', 'socks4://', 'socks5://')):
+        return proxy_str
+    # 默认按端口猜测
+    parts = proxy_str.split(':')
+    if len(parts) == 2 and parts[1].isdigit():
+        port = int(parts[1])
+        # 常见 socks 端口
+        if port in (1080, 1081, 1085, 1086, 9050, 9051):
+            return f'socks5://{proxy_str}'
+    return f'http://{proxy_str}'
+
+def extract_ip_port(proxy_str):
+    """从标准代理字符串中提取 ip:port"""
+    # 去掉协议头
+    if '://' in proxy_str:
+        proxy_str = proxy_str.split('://', 1)[1]
+    return proxy_str
+
+# ==================== 抓取代理（带错误处理和死源跳过）====================
 def fetch_proxies_from_source(source):
     name = source['name']
+    if is_source_dead(name):
+        print(f"[跳过] 源 {name} 已被标记为失效，跳过本次运行")
+        return []
+
     url = source.get('url')
     timeout = source.get('timeout', 30)
 
-    # 处理内置源
     if source.get('type') == 'builtin':
         print(f"[内置] 使用备用内置代理列表: {len(source['proxies'])} 个")
         return source['proxies']
@@ -167,28 +214,27 @@ def fetch_proxies_from_source(source):
     for attempt in range(3):
         try:
             session = requests.Session()
-            retry = Retry(total=2, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-            adapter = HTTPAdapter(max_retries=retry)
+            retry = Retry(total=1, backoff_factor=0.5, status_forcelist=[500,502,503,504])
+            adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
             session.mount('http://', adapter)
             session.mount('https://', adapter)
 
             headers = {
-                'User-Agent': random.choice([
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-                    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
-                ])
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Connection': 'keep-alive'
             }
 
             response = session.get(url, headers=headers, timeout=timeout)
             proxies = []
 
             if source['type'] == 'plain':
-                lines = response.text.strip().split('\n')
-                for line in lines:
-                    proxy = line.strip()
-                    if re.match(r'\d+\.\d+\.\d+\.\d+:\d+', proxy):
-                        proxies.append(proxy)
+                for line in response.text.splitlines():
+                    line = line.strip()
+                    # 匹配 ip:port 格式
+                    if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$', line):
+                        proxies.append(line)
 
             elif source['type'] == 'json':
                 try:
@@ -206,30 +252,40 @@ def fetch_proxies_from_source(source):
                                     proxies.append(f"{item['ip']}:{item['port']}")
                     elif source['name'] == 'Geonode':
                         for item in data.get('data', []):
-                            if item.get('protocols') and 'http' in item.get('protocols', []):
+                            if item.get('protocols') and ('http' in item.get('protocols', []) or 'https' in item.get('protocols', [])):
                                 proxies.append(f"{item.get('ip')}:{item.get('port')}")
                     else:
-                        if isinstance(data, list):
-                            for item in data:
-                                if isinstance(item, str) and re.match(r'\d+\.\d+\.\d+\.\d+:\d+', item):
-                                    proxies.append(item)
+                        # 通用 JSON 解析
+                        items = data if isinstance(data, list) else data.get('data', []) if isinstance(data, dict) else []
+                        for item in items:
+                            if isinstance(item, dict):
+                                ip = item.get('ip') or item.get('host')
+                                port = item.get('port') or item.get('port_number')
+                                if ip and port:
+                                    proxies.append(f"{ip}:{port}")
+                            elif isinstance(item, str) and re.match(r'\d+\.\d+\.\d+\.\d+:\d+', item):
+                                proxies.append(item)
                 except json.JSONDecodeError:
-                    # 尝试按文本处理
-                    lines = response.text.strip().split('\n')
-                    for line in lines[:50]:
+                    # fallback 到文本解析
+                    for line in response.text.splitlines()[:200]:
                         if re.match(r'\d+\.\d+\.\d+\.\d+:\d+', line):
                             proxies.append(line.strip())
 
             elif source['type'] == 'html':
+                # 增强 HTML 解析
                 html = response.text
-                rows = re.findall(r'<tr[^>]*>.*?</td>', html, re.DOTALL)
-                for row in rows[1:30]:
+                # 尝试多种表格模式
+                rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL)
+                for row in rows[:80]:
                     cols = re.findall(r'<td[^>]*>(.*?)</td>', row)
                     if len(cols) >= 2:
                         ip = cols[0].strip()
                         port = cols[1].strip()
                         if re.match(r'\d+\.\d+\.\d+\.\d+', ip) and port.isdigit():
                             proxies.append(f"{ip}:{port}")
+                # 如果没找到，尝试直接匹配 IP:PORT 文本
+                if not proxies:
+                    proxies = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}:\d{1,5}\b', html)
 
             if proxies:
                 print(f"[OK] 从 {name} 获取到 {len(proxies)} 个代理")
@@ -241,96 +297,171 @@ def fetch_proxies_from_source(source):
             time.sleep(2 ** attempt)
 
     print(f"[失败] 从 {name} 抓取失败，已放弃")
+    mark_source_dead(name)  # 标记为死亡，短期不再使用
     return []
 
+# ==================== 递归引导抓取（关键改进）====================
 def gather_all_proxies():
     all_proxies = []
+    # 先并行抓取所有源
     with ThreadPoolExecutor(max_workers=len(PROXY_SOURCES)) as executor:
         future_to_source = {executor.submit(fetch_proxies_from_source, s): s for s in PROXY_SOURCES}
         for future in as_completed(future_to_source):
             proxies = future.result()
             all_proxies.extend(proxies)
+
     all_proxies = list(set(all_proxies))
+
+    # 如果抓取到的代理很少（<50），且已有内置代理，则使用内置代理作为引导去重新抓取
+    if len(all_proxies) < 50:
+        print("[引导] 抓取到的代理数量过少，尝试使用内置代理或缓存代理作为引导，重新抓取其它源...")
+        # 获取内置代理
+        bootstrap_proxies = []
+        for s in PROXY_SOURCES:
+            if s.get('type') == 'builtin':
+                bootstrap_proxies.extend(s.get('proxies', []))
+        # 如果缓存中有上次有效代理，也加入引导
+        cached = load_cache()
+        if cached:
+            bootstrap_proxies.extend(cached[:20])  # 取前20个
+        bootstrap_proxies = list(set(bootstrap_proxies))
+
+        if bootstrap_proxies:
+            print(f"[引导] 使用 {len(bootstrap_proxies)} 个引导代理，重新抓取失败的源...")
+            # 重新抓取那些之前失败的源（但跳过 builtin 源本身）
+            for s in PROXY_SOURCES:
+                if s.get('type') != 'builtin' and is_source_dead(s['name']):
+                    # 尝试用引导代理去重新抓取
+                    proxies_from_bootstrap = fetch_with_bootstrap_proxies(s, bootstrap_proxies)
+                    all_proxies.extend(proxies_from_bootstrap)
+            all_proxies = list(set(all_proxies))
+
     print(f"\n[数据] 总共收集到 {len(all_proxies)} 个不重复代理")
     return all_proxies
 
-def is_likely_overseas(proxy_ip):
-    """粗略判断是否为海外IP"""
-    for cn_prefix in CN_IP_RANGES:
-        if proxy_ip.startswith(cn_prefix):
-            return False
-    return True
+def fetch_with_bootstrap_proxies(source, bootstrap_proxies):
+    """使用引导代理列表去抓取某个源"""
+    name = source['name']
+    url = source.get('url')
+    if not url:
+        return []
+    print(f"[引导抓取] 使用引导代理尝试从 {name} 抓取...")
+    for proxy_str in bootstrap_proxies[:10]:  # 最多试10个引导代理
+        try:
+            proxies = { 'http': proxy_str, 'https': proxy_str }
+            session = requests.Session()
+            session.proxies = proxies
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            resp = session.get(url, headers=headers, timeout=20)
+            if resp.status_code == 200:
+                # 解析代理
+                proxies_found = []
+                if source['type'] == 'plain':
+                    for line in resp.text.splitlines():
+                        if re.match(r'\d+\.\d+\.\d+\.\d+:\d+', line.strip()):
+                            proxies_found.append(line.strip())
+                elif source['type'] == 'json':
+                    try:
+                        data = resp.json()
+                        # 简化解析
+                        items = data if isinstance(data, list) else data.get('data', [])
+                        for item in items:
+                            if isinstance(item, dict) and 'ip' in item and 'port' in item:
+                                proxies_found.append(f"{item['ip']}:{item['port']}")
+                    except:
+                        pass
+                if proxies_found:
+                    print(f"[引导成功] 从 {name} 抓取到 {len(proxies_found)} 个代理")
+                    return proxies_found
+        except Exception as e:
+            continue
+    return []
 
-def test_proxy_for_target_optimized(proxy, target_url):
+# ==================== 验证核心函数（带内容验证）====================
+def test_proxy_for_target_optimized(proxy_with_proto, target_url):
     """
-    优化版代理测试：优先使用HEAD请求，失败则降级为GET
+    测试代理是否能访问目标网站
+    proxy_with_proto: 例如 http://1.2.3.4:8080 或 socks5://1.2.3.4:1080
+    返回 (proxy_str, success, speed_ms, ip_addr)
     """
-    proxies = {
-        'http': f'http://{proxy}',
-        'https': f'http://{proxy}'
+    # 提取 ip:port 用于后续显示
+    proxy_clean = extract_ip_port(proxy_with_proto)
+    proxies = {}
+    # 根据协议设置
+    if proxy_with_proto.startswith('socks4://'):
+        proxies = {
+            'http': proxy_with_proto,
+            'https': proxy_with_proto
+        }
+    elif proxy_with_proto.startswith('socks5://'):
+        proxies = {
+            'http': proxy_with_proto,
+            'https': proxy_with_proto
+        }
+    else:
+        # 默认为 http
+        proxies = {
+            'http': proxy_with_proto,
+            'https': proxy_with_proto
+        }
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Connection': 'keep-alive'
     }
-    headers = {'User-Agent': 'Mozilla/5.0'}
 
     try:
         start_time = time.time()
-
-        if TEST_METHOD == 'head':
-            try:
-                response = requests.head(
-                    target_url,
-                    proxies=proxies,
-                    timeout=TIMEOUT,
-                    headers=headers,
-                    allow_redirects=True,
-                    verify=False
-                )
-                elapsed_ms = int((time.time() - start_time) * 1000)
-                if response.status_code < 400:
-                    proxy_ip = proxy.split(':')[0]
-                    if is_likely_overseas(proxy_ip):
-                        return (proxy, True, elapsed_ms, proxy_ip)
-                    else:
-                        return (proxy, False, elapsed_ms, proxy_ip)
-                else:
-                    return (proxy, False, 0, '')
-            except:
-                pass
-
-        start_time = time.time()
+        # 使用 GET 请求，分拆超时
         response = requests.get(
             target_url,
             proxies=proxies,
-            timeout=TIMEOUT,
+            timeout=(TIMEOUT_CONNECT, TIMEOUT_READ),
             headers=headers,
             allow_redirects=True,
             verify=False
         )
         elapsed_ms = int((time.time() - start_time) * 1000)
 
-        if response.status_code < 400:
-            proxy_ip = proxy.split(':')[0]
-            if is_likely_overseas(proxy_ip):
-                return (proxy, True, elapsed_ms, proxy_ip)
-            else:
-                return (proxy, False, elapsed_ms, proxy_ip)
-        else:
-            return (proxy, False, 0, '')
+        # 状态码检查
+        if response.status_code >= 400:
+            return (proxy_clean, False, 0, '')
+
+        # 内容验证（可选）
+        if VERIFY_CONTENT and TARGET_KEYWORD.lower() not in response.text.lower():
+            # 可能被重定向到验证页面或者空白页
+            return (proxy_clean, False, 0, '')
+
+        # 简单判断 IP 地理位置（不再强制排除国内，仅标记）
+        # 提取代理的 IP
+        ip_addr = proxy_clean.split(':')[0]
+        # 不进行海外过滤，全部保留，由用户自行决定
+        return (proxy_clean, True, elapsed_ms, ip_addr)
 
     except Exception:
-        return (proxy, False, 0, '')
+        return (proxy_clean, False, 0, '')
 
-def validate_proxies_for_target(proxies, target_url):
+def validate_proxies_for_target(proxies_raw, target_url):
     """
-    并发验证代理对目标网站的可用性（优化版）
+    并发验证代理对目标网站的可用性
+    proxies_raw: 未规范化的代理列表（ip:port 格式）
     """
+    # 规范化：统一添加协议
+    normalized = []
+    for p in proxies_raw:
+        if isinstance(p, dict):
+            p = p.get('proxy', p.get('ip_port', ''))
+        if p:
+            normalized.append(normalize_proxy(p))
+    proxies = list(set(normalized))
+
     print(f"[开始] 验证 {len(proxies)} 个代理能否访问 {target_url}...")
-    print(f"[信息] 将随机测试最多 {MAX_PROXIES_TO_TEST} 个代理")
-
     if len(proxies) > MAX_PROXIES_TO_TEST:
         test_proxies = random.sample(proxies, MAX_PROXIES_TO_TEST)
     else:
         test_proxies = proxies
-
     print(f"[目标] 实际测试 {len(test_proxies)} 个代理")
 
     valid_proxies = []
@@ -344,33 +475,35 @@ def validate_proxies_for_target(proxies, target_url):
 
         for future in as_completed(future_to_proxy):
             tested += 1
-            proxy, can_access, speed, ip_addr = future.result()
+            proxy_clean, can_access, speed, ip_addr = future.result()
 
-            if tested % 10 == 0 or tested == len(test_proxies):
+            if tested % 50 == 0 or tested == len(test_proxies):
                 print(f"[进度] {tested}/{len(test_proxies)} | 已发现有效: {len(valid_proxies)}")
 
-            if can_access and speed < MIN_SPEED:
-                print(f"[可用] 可访问 {target_url} 的海外代理: {proxy} - {speed}ms")
-                valid_proxies.append({
-                    'proxy': proxy,
-                    'speed': speed,
-                    'ip': ip_addr,
-                    'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                })
-            elif can_access and speed >= MIN_SPEED:
-                print(f"[慢速] 速度较慢但可访问: {proxy} - {speed}ms")
+            if can_access:
+                # 速度过滤
+                if speed < MIN_SPEED:
+                    print(f"[可用] {proxy_clean} - {speed}ms")
+                    valid_proxies.append({
+                        'proxy': proxy_clean,
+                        'speed': speed,
+                        'ip': ip_addr,
+                        'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    })
+                else:
+                    print(f"[慢速] {proxy_clean} - {speed}ms (超过阈值 {MIN_SPEED}ms)")
 
     valid_proxies.sort(key=lambda x: x['speed'])
     return valid_proxies
 
+# ==================== 保存结果 ====================
 def save_results(valid_proxies, target_url):
-    """保存结果到文件，并更新缓存"""
     if not valid_proxies:
-        print(f"[结果] 没有找到能访问 {target_url} 的可用海外代理")
+        print(f"[结果] 没有找到能访问 {target_url} 的可用代理")
         return
 
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-        f.write(f"# 可访问 {target_url} 的海外代理列表 - 按速度排序\n")
+        f.write(f"# 可访问 {target_url} 的代理列表 - 按速度排序\n")
         f.write(f"# 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"# 共 {len(valid_proxies)} 个\n")
         f.write("# 格式: IP:端口 (响应时间)\n\n")
@@ -381,27 +514,28 @@ def save_results(valid_proxies, target_url):
     with open(json_file, 'w', encoding='utf-8') as f:
         json.dump(valid_proxies, f, indent=2, ensure_ascii=False)
 
-    # 保存缓存（仅保存代理字符串列表）
     proxy_list = [item['proxy'] for item in valid_proxies]
     save_cache(proxy_list)
 
     print(f"\n[保存] 结果已保存到: {OUTPUT_FILE} 和 {json_file}")
-    print(f"\n[排行] 最快的前10个可访问 {target_url} 的代理:")
+    print(f"\n[排行] 最快的前10个代理:")
     for i, item in enumerate(valid_proxies[:10]):
         print(f"   {i+1}. {item['proxy']} - {item['speed']}ms")
 
+# ==================== 主函数 ====================
 def main():
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     print("="*70)
-    print("*** 海外免费代理自动搜索工具 v3.4（增强版）***")
+    print("*** 海外免费代理自动搜索工具 v4.0（完整整合增强版）***")
     print("="*70)
     print(f"目标网站: {TEST_URL}")
+    print(f"内容验证: {'开启' if VERIFY_CONTENT else '关闭'} (关键词 '{TARGET_KEYWORD}')")
     print(f"结果保存目录: {OUTPUT_DIR}")
     print("="*70)
 
     print(f"\n[时间] 开始探测: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("[步骤1] 从多个免费源收集代理...")
+    print("[步骤1] 从多个免费源收集代理（含引导机制）...")
     all_proxies = gather_all_proxies()
 
     if not all_proxies:
