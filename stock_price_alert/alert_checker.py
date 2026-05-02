@@ -507,9 +507,6 @@ def is_trading_day(dt=None):
 
 def job():
     """定时任务：重新加载配置后执行检查"""
-    if not is_trading_day():
-        logger.info("今天是非交易日，跳过所有检查")
-        return
     logger.info("========== 开始执行定时任务 ==========")
     load_config()  # 每次运行前重新加载配置
     check_price_alerts()
@@ -522,6 +519,9 @@ _checker_thread = None
 _stop_event = threading.Event()
 
 def _run_schedule():
+    if not is_trading_day():
+        logger.info("今天是非交易日，跳过所有检查")
+        return
     """在单独线程中运行 schedule 循环"""
     schedule.every(5).minutes.do(job)
     # 立即执行一次，便于启动后快速检查
