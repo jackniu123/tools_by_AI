@@ -56,6 +56,9 @@ def create_desktop_shortcut():
 
 def run_proxy_finder():
     """在独立线程中运行代理查找程序"""
+    return
+    # 没有必要找代理地址了，因为protonvpn在有代理的情况下反而容易出问题
+
     try:
         proxy_finder.proxy_finder.main()
     except Exception as e:
