@@ -75,10 +75,11 @@ def run_new_stock_monitor():
 
 def run_price_alert_checker():
     """在独立线程中运行股价提醒检查器（该函数内部已创建独立线程）"""
-    try:
-        stock_price_alert.alert_checker.start_checker()
-    except Exception as e:
-        print(f"股价提醒检查器启动失败: {e}")
+    pass
+    # try:
+    #     stock_price_alert.alert_checker.start_checker()
+    # except Exception as e:
+    #     print(f"股价提醒检查器启动失败: {e}")
 
 
 def run_buffet_change_checker():
